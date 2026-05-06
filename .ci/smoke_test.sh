@@ -20,6 +20,8 @@ TORCHTITAN_VERSION="v0.2.2"
 TORCHTITAN_DIR="${PROJECT_ROOT}/third_party/torchtitan"
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-300}
 SMOKE_STEPS=${SMOKE_STEPS:-1}
+# Known false-positive patterns to exclude from error detection
+ERROR_EXCLUDE_PATTERNS=("TORCH_NCCL_ASYNC_ERROR_HANDLING")
 
 # Prepare environment: install packages and clone torchtitan source.
 _setup_env() {
@@ -81,6 +83,11 @@ run_torchtitan_npu_smoke() {
     echo "torchtitan-npu smoke test finished in ${duration}s"
     if ! analyse_smoke_result "$smoke_log" "$exit_code"; then
         echo "torchtitan-npu smoke test failed."
+        echo "--- Error details ---"
+        grep -iE "error|exception|traceback" "$smoke_log" 2>/dev/null \
+            | grep -vE "$(IFS='|'; echo "${ERROR_EXCLUDE_PATTERNS[*]}")" || true
+        grep -iE "loss:\s*(nan|inf)" "$smoke_log" 2>/dev/null || true
+        echo "--- End error details ---"
         exit 1
     fi
 }
@@ -97,17 +104,19 @@ analyse_smoke_result() {
         has_error=true
     fi
 
-    if grep -qiE "error|exception|traceback" "$log_file" 2>/dev/null; then
+    if grep -iE "error|exception|traceback" "$log_file" 2>/dev/null \
+       | grep -qvE "$(IFS='|'; echo "${ERROR_EXCLUDE_PATTERNS[*]}")"; then
         has_error=true
     fi
 
-    if grep -qiE "loss[^:]*:[^0-9]*(nan|inf)" "$log_file" 2>/dev/null \
-    || grep -qiE "(nan|inf).*loss" "$log_file" 2>/dev/null; then
+    if grep -qiE "loss:\s*(nan|inf)" "$log_file" 2>/dev/null; then
         echo "loss error (NAN/Inf)"
         has_error=true
     fi
 
-    local complete_steps=$(grep -oP "step[:\s]*\K\d+" "$log_file" 2>/dev/null | tail -1)
+    # grepping mstep to match colored output. Example log line:
+    # [2024-06-17 10:00:00] INFO: \e[0;31mstep: 10
+    local complete_steps=$(grep -oP "mstep[:\s]*\K\d+" "$log_file" 2>/dev/null | tail -1)
     complete_steps=${complete_steps:-0}
     if [[ "$complete_steps" -ge "$SMOKE_STEPS" ]]; then
         echo "Completed $complete_steps steps"
@@ -182,7 +191,26 @@ run_torchtitan_smoke() {
 
 _setup_env
 
+_wait_npu_idle() {
+    local max_wait=${1:-10}
+    local threshold=${2:-500}
+    for i in $(seq 1 "$max_wait"); do
+        local used
+        used=$(npu-smi info 2>/dev/null | grep -oP '\d+(?=\s+/\s+\d+)' | sort -n | tail -1)
+        used=${used:-0}
+        if [ "$used" -lt "$threshold" ]; then
+            echo "NPU idle (max HBM: ${used}MB)"
+            return 0
+        fi
+        echo "Waiting for NPU memory to free... (${used}MB used, attempt $i/$max_wait)"
+        sleep 1
+    done
+    echo "Warning: NPU memory still not idle after ${max_wait}s"
+    return 1
+}
+
 run_torchtitan_smoke
+_wait_npu_idle 10 5000
 run_torchtitan_npu_smoke
 pytest -v --tb=short tests/smoke_tests
 

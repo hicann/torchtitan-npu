@@ -7,11 +7,14 @@
 # LICENSE file in the root directory of this source tree.
 
 import argparse
+import logging
 import os
 import re
 import sys
 from pathlib import Path
 from typing import List  # noqa: PEA001
+
+logger = logging.getLogger(__name__)
 
 sys.path.append(str(Path(__file__).parents[2]))
 ROOT = Path(__file__).parents[2]
@@ -38,6 +41,7 @@ def modify_final_cmd(original_cmd):
             os.makedirs(dump_folder)
         log_path = f"{dump_folder}/test.log"
         modified_cmd += f" 2>&1 | tee {log_path}"
+    logger.info("Modified command: %s", modified_cmd)
     return modified_cmd
 
 
@@ -56,6 +60,7 @@ def _base_tests() -> List[OverrideDefinitions]:
             [["--model.name deepseek_v32", "--model.flavor tinymodel"]],
             "DeepSeek V32 BASE",
             "deepseek_v32_base",
+            ngpu=2,
         ),
         # Model MTP Test Case for DeepSeek V32
         OverrideDefinitions(
@@ -69,6 +74,7 @@ def _base_tests() -> List[OverrideDefinitions]:
             ],
             "DeepSeek V32 MTP",
             "deepseek_v32_mtp",
+            ngpu=2,
         ),
     ]
 
@@ -87,6 +93,7 @@ def _cp_tests() -> List[OverrideDefinitions]:
             ],
             "DeepSeek V32 CP DSA",
             "deepseek_v32_cp_dsa",
+            ngpu=2,
         ),
         OverrideDefinitions(
             [
@@ -99,6 +106,7 @@ def _cp_tests() -> List[OverrideDefinitions]:
             ],
             "DeepSeek V3 CP Ulysses",
             "deepseek_v3_cp_ulysses",
+            ngpu=2,
         ),
     ]
 
