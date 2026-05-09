@@ -189,6 +189,16 @@ def parallelize_deepseek_v4(
             f"FlexAttention and varlen attention are not supported with CP."
         )
 
+    if job_config.parallelism.context_parallel_degree > 1:
+        from torchtitan_npu.distributed.context_parallel.deepseek_v4_cp import (
+            patch_deepseek_v4_for_context_parallel,
+        )
+
+        cp_mesh = parallel_dims.get_mesh("cp")
+        # pyrefly: ignore [bad-argument-type]
+        patch_deepseek_v4_for_context_parallel(model, cp_mesh)
+        logger.info("Applied Context Parallel to DeepSeek-V4 model")
+
     # patch the indexer loss tracking with distributed version to get the synchronized indexer loss metric
     apply_distributed_indexer_loss_tracking(parallel_dims)
 

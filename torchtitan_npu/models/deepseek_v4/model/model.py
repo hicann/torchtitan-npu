@@ -607,9 +607,7 @@ class SparseAttention(torch.nn.Module):
         kv_compress: torch.Tensor | None = None,
         compress_topk_idxs: torch.Tensor | None = None,
     ):
-        topk_idxs = None
         bsz, seqlen, _, _ = query_states.size()
-
         topk_idxs = self.get_window_topk_idxs(self.window_size, bsz, seqlen)
         if self.compress_ratio > 1:
             offset = kv_states.size(1)
@@ -1295,6 +1293,7 @@ class DeepSeekV4Model(ModelProtocol):
         tokens: torch.Tensor,
         input_ids: torch.Tensor | None = None,
         attention_masks: AttentionMasksType | None = None,
+        positions: torch.Tensor | None = None,
     ):
         """
         Forward pass for the Transformer model.

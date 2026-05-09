@@ -79,19 +79,88 @@ def npu_sparse_attn_shared_kv(
     return output.contiguous()
 
 
-def sdpa_to_sfa_adapter(
-    self, query_states, kv_states, attn_sink, kv_compress, compress_topk_idxs
+def _c128a_cp_sfa_with_global_positions(
+    self,
+    query_states,
+    kv_states,
+    attn_sink,
+    kv_compress,
 ):
+    """Run C128A CP rank1 through SFA by restoring global token positions.
 
+    The SFA kernel computes each query's effective position as (S2 - S1) + local_i,
+    so padding only kv to length global_start * cp is sufficient: with S1=chunk_size
+    and S2=global_seq_len, S2-S1=global_start shifts the window automatically.
+    """
+    cp_rank = getattr(self, "cp_rank", 0)
+    n_boundary = self.window_size - 1
+    bsz, seq_len, _n_heads, _head_dim = query_states.shape
+    global_start = cp_rank * seq_len
+
+    kv_prefix_len = global_start - n_boundary
+    kv_states = kv_states.contiguous()
+    kv_prefix = torch.zeros(
+        bsz,
+        kv_prefix_len,
+        kv_states.size(-1),
+        dtype=kv_states.dtype,
+        device=kv_states.device,
+    )
+    kv_padded = torch.cat([kv_prefix, kv_states], dim=1)
+
+    return npu_sparse_attn_shared_kv(
+        query=query_states,
+        ori_kv=kv_padded,
+        cmp_kv=kv_compress,
+        cmp_sparse_indices=None,
+        sinks=attn_sink.float(),
+        softmax_scale=self.softmax_scale,
+        cmp_ratio=self.compress_ratio,
+    )
+
+
+def sdpa_to_sfa_adapter(
+    self,
+    query_states,
+    kv_states,
+    attn_sink,
+    kv_compress=None,
+    compress_topk_idxs=None,
+):
     if compress_topk_idxs is not None:
         if compress_topk_idxs.dtype != torch.int32:
             compress_topk_idxs = compress_topk_idxs.to(torch.int32)
 
+    cp_rank = getattr(self, "cp_rank", 0)
+    if cp_rank > 0:
+        n_boundary = self.window_size - 1  # 127
+
+        if self.compress_ratio == 128:
+            # Restore C128A tensor positions to global token coordinates.
+            return _c128a_cp_sfa_with_global_positions(
+                self, query_states, kv_states, attn_sink, kv_compress
+            )
+
+        if self.compress_ratio == 1:
+            # kv_states layout for rank>0: [boundary_w-1 || local_chunk], so
+            # SFA band mode naturally maps query i to kv_states[i:i + window_size].
+            return npu_sparse_attn_shared_kv(
+                query=query_states,
+                ori_kv=kv_states,
+                cmp_kv=None,
+                cmp_sparse_indices=None,
+                sinks=attn_sink.float(),
+                softmax_scale=self.softmax_scale,
+                cmp_ratio=self.compress_ratio,
+                ori_win_left=n_boundary,
+            )
+
+    # Rank0/non-CP uses the kernel's native causal positions.
     output = npu_sparse_attn_shared_kv(
         query=query_states,
         ori_kv=kv_states,
         cmp_kv=kv_compress,
-        cmp_sparse_indices=compress_topk_idxs,
+        cmp_sparse_indices=compress_topk_idxs if self.compress_ratio == 4 else None,
         sinks=attn_sink.float(),
         softmax_scale=self.softmax_scale,
         cmp_ratio=self.compress_ratio,

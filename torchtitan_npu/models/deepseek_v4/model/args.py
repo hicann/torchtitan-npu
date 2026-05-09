@@ -118,11 +118,8 @@ class DeepSeekV4ModelArgs(BaseModelArgs):
             )
         self.max_seq_len = seq_len
 
-        if (
-            job_config.parallelism.context_parallel_degree > 1
-            # pyrefly: ignore [missing-attribute]
-            and self.attn_type != "sdpa"
-        ):
+        attn_type = getattr(self, "attn_type", "sdpa")
+        if job_config.parallelism.context_parallel_degree > 1 and attn_type != "sdpa":
             raise NotImplementedError("CP support is only supported for SDPA.")
 
         self.moe_args._debug_force_load_balance = (
