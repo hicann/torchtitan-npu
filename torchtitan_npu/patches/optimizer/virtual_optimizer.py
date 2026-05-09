@@ -15,6 +15,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+from functools import wraps
+from typing import Any, cast
 
 import torch
 import torch_npu
@@ -25,6 +27,8 @@ from torch.distributed._tensor import DTensor
 logger = logging.getLogger(__name__)
 
 _original_build_optimizers = torchtitan.components.optimizer.build_optimizers
+
+OPTIMIZER_STATE_KEYS = ["exp_avg", "exp_avg_sq", "max_exp_avg_sq"]
 
 
 def unwrap_dtensor(tensor):
@@ -45,6 +49,10 @@ def wrap_like_param(local_tensor: torch.Tensor, p: DTensor | torch.Tensor):
             run_check=False,
         )
     return local_tensor
+
+
+def is_swap_tensor(tensor: torch.Tensor) -> bool:
+    return hasattr(tensor, "swap_tensor") and tensor.swap_tensor
 
 
 def _initialize_state(optimizer, p, amsgrad):
@@ -90,30 +98,22 @@ def _apply_fused_kernel(group, kernel_args):
 
 
 def virtual_optimizer_step_impl(self, closure=None):
-    """Simplified optimizer step implementation with lower complexity."""
     loss = None
     if closure is not None:
         with torch.enable_grad():
             loss = closure()
 
     for group in self.param_groups:
-        # Step increment logic
-        if "step" not in group:
-            group["step"] = torch.tensor(
-                1, dtype=torch.int64, device=torch_npu.npu.current_device()
-            )
-        else:
-            group["step"] += 1
-            if group["step"].is_cpu:
-                group["step"] = group["step"].npu()
-
         for p in group["params"]:
             if p.grad is None:
                 continue
-
             state = _initialize_state(self, p, group["amsgrad"])
 
-            # Prepare common arguments for fused kernels to avoid duplication
+            if "step" not in state:
+                state["step"] = torch.tensor(1, dtype=torch.int64, device=p.device)
+            else:
+                state["step"] += 1
+
             kernel_args = {
                 "params": [p],
                 "grads": [p.grad],
@@ -122,7 +122,7 @@ def virtual_optimizer_step_impl(self, closure=None):
                 "max_exp_avg_sqs": [state["max_exp_avg_sq"]]
                 if group["amsgrad"]
                 else [],
-                "step_tensors": [group["step"]],
+                "step_tensors": [state["step"]],
             }
 
             _apply_fused_kernel(group, kernel_args)
@@ -205,6 +205,88 @@ class VirtualAllocator:
             return self.get_memory(p)
 
 
+def sanitize(obj):
+    if isinstance(obj, dict):
+        return {k: sanitize(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize(x) for x in obj]
+    elif isinstance(obj, torch.Tensor):
+        return obj.detach()
+    return obj
+
+
+def _process_state_tensor(state, k):
+    local_t = unwrap_dtensor(state[k])
+    cpu_t = local_t.cpu().clone()
+    if hasattr(cpu_t, "swap_tensor"):
+        object.__delattr__(cpu_t, "swap_tensor")
+    state[k] = wrap_like_param(cpu_t, state[k])
+
+
+def _save_original_states(self):
+    """Save original states before conversion and process state tensors."""
+    original_states = {}
+    if not hasattr(self, "virtual_allocator"):
+        return original_states
+    for p, state in self.state.items():
+        original_states[p] = {k: v for k, v in state.items()}
+        for k in OPTIMIZER_STATE_KEYS:
+            if k in state and isinstance(state[k], torch.Tensor):
+                _process_state_tensor(state, k)
+    return original_states
+
+
+def _restore_original_states(self, original_states):
+    """Restore original states after state_dict save."""
+    if not original_states:
+        return
+    for p, o_state in original_states.items():
+        for k, v in o_state.items():
+            if v is not None:
+                self.state[p][k] = v
+
+
+def patched_state_dict(self) -> dict[str, Any]:
+    original_states = _save_original_states(self)
+    sd = self._original_state_dict()  # type: ignore[assignment]
+    sd = cast(dict[str, Any], sanitize(sd))
+    _restore_original_states(self, original_states)
+    return sd
+
+
+def _restore_single_tensor(state, k, p, allocator):
+    if k in state and state[k] is not None:
+        local_t = unwrap_dtensor(state[k])
+        if not is_swap_tensor(local_t):
+            swap_t = allocator.create(local_t)
+            swap_t.copy_(local_t)
+            state[k] = wrap_like_param(swap_t, state[k])
+
+
+def _process_step_device(state, p):
+    if "step" in state and isinstance(state["step"], torch.Tensor):
+        if state["step"].device.type == "cpu":
+            state["step"] = state["step"].to(p.device)
+
+
+def _update_param_states(optimizer, p):
+    """Update all optimizer state tensors for a parameter."""
+    state = optimizer.state.get(p)
+    if not state:
+        return
+    for k in OPTIMIZER_STATE_KEYS:
+        _restore_single_tensor(state, k, p, optimizer.virtual_allocator)
+    _process_step_device(state, p)
+
+
+def virtual_optimizer_replace(optimizer):
+    if not hasattr(optimizer, "virtual_allocator"):
+        return
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            _update_param_states(optimizer, p)
+
+
 def virtual_optimizer_step(self, closure=None):
     if not hasattr(self, "virtual_allocator"):
         pp_rank, pp_size, virtual_size = self._allocator_config
@@ -214,6 +296,81 @@ def virtual_optimizer_step(self, closure=None):
     with torch.no_grad():
         loss = virtual_optimizer_step_impl(self, closure)
     return loss
+
+
+def swap_tensor_copy_wrapper(func):
+    def wrapped(*args, **kwargs):
+        dst, src = args[0], args[1]
+        non_blocking = kwargs.get("non_blocking", False)
+
+        if dst is src:
+            return dst
+
+        dst_swap = is_swap_tensor(dst)
+        src_swap = is_swap_tensor(src)
+        dst_dev = dst.device
+        src_dev = src.device
+
+        if dst_swap or src_swap:
+            if dst.shape != src.shape:
+                raise RuntimeError(
+                    f"Shape mismatch in swap tensor copy: {dst.shape} vs {src.shape}"
+                )
+            if dst_dev.type == "cpu" and src_dev.type == "cpu":
+                func(dst, src, non_blocking=non_blocking)
+
+            elif dst_dev.type == "cpu" and (src_dev.type == "npu" or src_swap):
+                src_cpu = src.to(dst_dev, non_blocking=non_blocking)
+                func(dst, src_cpu, non_blocking=non_blocking)
+
+            elif (dst_dev.type == "npu" or dst_swap) and src_dev.type == "cpu":
+                dst.copy_(src, non_blocking=non_blocking)
+
+            elif (dst_dev.type == "npu" or dst_swap) and (
+                src_dev.type == "npu" or src_swap
+            ):
+                if dst_dev == src_dev:
+                    dst.fill_(1).mul_(src)
+                else:
+                    src_npu = src.to(dst_dev, non_blocking=non_blocking)
+                    dst.fill_(1).mul_(src_npu)
+        else:
+            func(*args, **kwargs)
+
+        return dst
+
+    return wrapped
+
+
+def swap_tensor_func_wrapper(org_func, func_type):
+    def wrapped(*args, **kwargs):
+        if is_swap_tensor(args[0]):
+            if func_type == "detach":
+                detach = org_func(*args, **kwargs)
+                detach.swap_tensor = True
+                detach.data.swap_tensor = True
+                return detach
+            src = torch.empty_like(args[0])
+            src.copy_(args[0])
+            if func_type == "cpu":
+                return src.cpu()
+            elif func_type == "clone":
+                return src
+            else:
+                raise ValueError(f"func_type {func_type} not supported")
+        else:
+            return org_func(*args, **kwargs)
+
+    return wrapped
+
+
+def _make_patched_load(orig_load):
+    @wraps(orig_load)  # type: ignore[assignment]
+    def patched_load(self, state_dict):
+        self._original_load_state_dict(state_dict)  # type: ignore[assignment]
+        virtual_optimizer_replace(self)
+
+    return patched_load
 
 
 def build_optimizers_with_virtual_optimizer(
@@ -235,9 +392,19 @@ def build_optimizers_with_virtual_optimizer(
             "virtual_optimizer_size must be specified when virtual_optimizer is enabled."
         )
 
-    # Patch optimizer steps
-    torch.optim.AdamW.step = virtual_optimizer_step
-    torch.optim.Adam.step = virtual_optimizer_step
+    torch.Tensor.copy_ = swap_tensor_copy_wrapper(torch.Tensor.copy_)
+    torch.Tensor.cpu = swap_tensor_func_wrapper(torch.Tensor.cpu, "cpu")
+    torch.Tensor.clone = swap_tensor_func_wrapper(torch.Tensor.clone, "clone")
+    torch.Tensor.detach = swap_tensor_func_wrapper(torch.Tensor.detach, "detach")
+
+    for cls in [torch.optim.AdamW, torch.optim.Adam]:
+        if not hasattr(cls, "_original_state_dict"):
+            cls._original_state_dict = cls.state_dict  # type: ignore[assignment]
+            cls.state_dict = patched_state_dict  # type: ignore[assignment]
+            cls.step = virtual_optimizer_step  # type: ignore[assignment]
+
+            cls._original_load_state_dict = cls.load_state_dict  # type: ignore[assignment]
+            cls.load_state_dict = _make_patched_load(cls.load_state_dict)  # type: ignore[assignment]
 
     optimizers = _original_build_optimizers(
         model_parts, optimizer_config, parallel_dims, ft_manager
