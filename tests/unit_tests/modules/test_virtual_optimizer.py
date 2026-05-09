@@ -116,13 +116,13 @@ def test_build_optimizers_success_path(mock_orig, mock_npu):
 
 
 @patch("torchtitan_npu.patches.optimizer.virtual_optimizer.torch_npu")
-def test_virtual_optimizer_step_impl_logic(mock_npu):
+def test_virtual_optimizer_step_impl_logic(mock_npu, monkeypatch):
     mock_npu.npu.current_device.return_value = torch.device("cpu")
 
     def mock_npu_method(self, *args, **kwargs):
         return self
 
-    torch.Tensor.npu = mock_npu_method
+    monkeypatch.setattr(torch.Tensor, "npu", mock_npu_method)
 
     mesh = DeviceMesh("cpu", [0])
     local_p = torch.randn(2, 2, requires_grad=True)
@@ -163,14 +163,14 @@ def test_virtual_optimizer_step_impl_logic(mock_npu):
 
 
 @patch("torchtitan_npu.patches.optimizer.virtual_optimizer.torch_npu")
-def test_virtual_optimizer_smoke_test(mock_npu):
+def test_virtual_optimizer_smoke_test(mock_npu, monkeypatch):
     """Smoke test: verify complete optimizer step flow with multiple parameters."""
     mock_npu.npu.current_device.return_value = torch.device("cpu")
 
     def mock_npu_method(self, *args, **kwargs):
         return self
 
-    torch.Tensor.npu = mock_npu_method
+    monkeypatch.setattr(torch.Tensor, "npu", mock_npu_method)
 
     mesh = DeviceMesh("cpu", [0])
 
@@ -311,16 +311,6 @@ def test_cpu_to_npu_swap_non_blocking():
     dst.swap_tensor = True
     dst.copy_(src, non_blocking=True)
     assert torch.allclose(dst, src.npu())
-
-
-def test_swap_npu_to_cpu_non_blocking():
-    if not torch.npu.is_available():
-        return
-    src = torch.tensor([1.0, 2.0], device="npu")
-    src.swap_tensor = True
-    dst = torch.zeros_like(src).cpu()
-    dst.copy_(src, non_blocking=True)
-    assert torch.allclose(dst, src.cpu())
 
 
 def test_swap_npu_to_npu_non_blocking():

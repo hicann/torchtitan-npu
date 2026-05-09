@@ -324,7 +324,8 @@ def swap_tensor_copy_wrapper(func):
                 func(dst, src_cpu, non_blocking=non_blocking)
 
             elif (dst_dev.type == "npu" or dst_swap) and src_dev.type == "cpu":
-                dst.copy_(src, non_blocking=non_blocking)
+                src_npu = src.to(dst_dev, non_blocking=non_blocking)
+                dst.fill_(1).mul_(src_npu)
 
             elif (dst_dev.type == "npu" or dst_swap) and (
                 src_dev.type == "npu" or src_swap
