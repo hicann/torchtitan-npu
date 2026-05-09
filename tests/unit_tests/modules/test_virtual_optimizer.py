@@ -14,6 +14,7 @@ import torchtitan.components.optimizer as tt_optimizer
 from torch.distributed._tensor import DeviceMesh, DTensor, Replicate, Shard
 
 from torchtitan_npu.patches.optimizer.virtual_optimizer import (
+    swap_tensor_copy_wrapper,
     unwrap_dtensor,
     virtual_optimizer_step_impl,
     VirtualAllocator,
@@ -221,3 +222,113 @@ def test_virtual_optimizer_smoke_test(mock_npu):
 
         assert "exp_avg_sq" in opt.state[p1_dtensor]
         assert mock_fused.call_count > first_call_count
+
+
+@pytest.fixture(autouse=True)
+def patch_copy():
+    original = torch.Tensor.copy_
+    torch.Tensor.copy_ = swap_tensor_copy_wrapper(torch.Tensor.copy_)
+    yield
+    torch.Tensor.copy_ = original
+
+
+def test_shape_mismatch():
+    dst = torch.zeros(3)
+    src = torch.zeros(4)
+    with pytest.raises(RuntimeError):
+        dst.copy_(src)
+
+
+def test_self_copy():
+    t = torch.tensor([1.0, 2.0])
+    res = t.copy_(t)
+    assert res is t
+
+
+def test_normal_cpu_to_cpu():
+    src = torch.tensor([1.0, 2.0, 3.0])
+    dst = torch.zeros_like(src)
+    dst.copy_(src)
+    assert torch.allclose(dst, src)
+
+
+def test_swap_cpu_to_cpu():
+    src = torch.tensor([1.0, 2.0, 3.0])
+    src.swap_tensor = True
+    dst = torch.zeros_like(src)
+    dst.swap_tensor = True
+    dst.copy_(src)
+    assert torch.allclose(dst, src)
+
+
+def test_swap_npu_to_cpu():
+    if not torch.npu.is_available():
+        return
+    src = torch.tensor([1.0, 2.0], device="npu")
+    src.swap_tensor = True
+    dst = torch.zeros_like(src).cpu()
+    dst.copy_(src)
+    assert torch.allclose(dst, src.cpu())
+
+
+def test_cpu_to_swap_npu():
+    if not torch.npu.is_available():
+        return
+    src = torch.tensor([1.0, 2.0], device="cpu")
+    dst = torch.zeros_like(src).npu()
+    dst.swap_tensor = True
+    dst.copy_(src)
+    assert torch.allclose(dst, src.npu())
+
+
+def test_swap_npu_to_swap_npu_same_device():
+    if not torch.npu.is_available():
+        return
+    src = torch.tensor([1.0, 2.0], device="npu")
+    src.swap_tensor = True
+    dst = torch.zeros_like(src).npu()
+    dst.swap_tensor = True
+    dst.copy_(src)
+    assert torch.allclose(dst, src)
+
+
+def test_swap_npu_to_swap_npu_cross_device():
+    if not torch.npu.is_available() or torch.npu.device_count() < 2:
+        return
+    src = torch.tensor([1.0, 2.0], device="npu:0")
+    src.swap_tensor = True
+    dst = torch.zeros(2, device="npu:1")
+    dst.swap_tensor = True
+    dst.copy_(src)
+    assert torch.allclose(dst, src.to("npu:1"))
+
+
+def test_cpu_to_npu_swap_non_blocking():
+    if not torch.npu.is_available():
+        return
+    src = torch.tensor([1.0, 2.0], device="cpu")
+    dst = torch.zeros_like(src).npu()
+    dst.swap_tensor = True
+    dst.copy_(src, non_blocking=True)
+    assert torch.allclose(dst, src.npu())
+
+
+def test_swap_npu_to_cpu_non_blocking():
+    if not torch.npu.is_available():
+        return
+    src = torch.tensor([1.0, 2.0], device="npu")
+    src.swap_tensor = True
+    dst = torch.zeros_like(src).cpu()
+    dst.copy_(src, non_blocking=True)
+    assert torch.allclose(dst, src.cpu())
+
+
+def test_swap_npu_to_npu_non_blocking():
+    if not torch.npu.is_available():
+        return
+    src = torch.tensor([1.0, 2.0], device="npu")
+    src.swap_tensor = True
+    dst = torch.zeros_like(src).npu()
+    dst.swap_tensor = True
+    dst.copy_(src, non_blocking=True)
+    assert torch.allclose(dst, src)
