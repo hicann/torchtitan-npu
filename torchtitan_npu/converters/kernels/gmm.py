@@ -1,10 +1,14 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 #
+# This file is derived from torchtitan,
+# https://github.com/pytorch/torchtitan/blob/v0.2.2/torchtitan/models/moe/moe.py
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
 import logging
-from typing import Any
 
 import torch
 
@@ -41,54 +45,11 @@ group_size_params = {
 }
 
 
-class GMMFunction(torch.autograd.Function):
-    @staticmethod
-    # pyrefly: ignore [bad-override]
-    def forward(ctx, x, weight, group_list) -> Any:
-        ctx.save_for_backward(x, weight)
-        ctx.group_list = group_list
-
-        fwd_output = torch_npu.npu_grouped_matmul(
-            [x],
-            [weight],
-            bias=None,
-            group_list=group_list,
-            split_item=2,
-            group_type=0,
-            group_list_type=1,
-        )[0]
-        return fwd_output
-
-    @staticmethod
-    # pyrefly: ignore [bad-override]
-    def backward(ctx, grad_output) -> Any:
-        input_tensor, weight = ctx.saved_tensors
-        group_list = ctx.group_list
-
-        weight = torch.transpose(weight, 1, 2)
-        grad_input = torch_npu.npu_grouped_matmul(
-            [grad_output],
-            [weight],
-            bias=None,
-            group_list=group_list,
-            split_item=2,
-            group_type=0,
-            group_list_type=1,
-        )[0]
-        grad_weight = torch_npu.npu_grouped_matmul(
-            [input_tensor.T],
-            [grad_output],
-            bias=None,
-            group_list=group_list,
-            split_item=3,
-            group_type=2,
-            group_list_type=1,
-        )[0]
-        return grad_input, grad_weight, None
-
-
 def npu_grouped_mm(x, weight, group_list):
-    return GMMFunction.apply(x, weight, group_list)
+    # This function is replaced at runtime by quantization converters
+    # (e.g. HiF8 / MXFP8) that patch the reference to quantize inputs
+    # before the grouped MM (see patches/quantization/quantize.py).
+    return torch._grouped_mm(x, weight, group_list)
 
 
 def _run_experts_grouped_mm(
@@ -98,7 +59,8 @@ def _run_experts_grouped_mm(
     num_tokens_per_expert: torch.Tensor,
     swiglu_limit: float | None = None,
 ) -> torch.Tensor:
-    offsets = num_tokens_per_expert.to(torch.int64)
+    # pyrefly: ignore [missing-attribute]
+    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int64)
 
     h = npu_grouped_mm(x.bfloat16(), w13.bfloat16().transpose(-2, -1), offsets)
     if swiglu_limit is not None:

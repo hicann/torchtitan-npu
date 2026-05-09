@@ -15,7 +15,6 @@ class GMMFunctionMxfp8(torch.autograd.Function):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(ctx, x, weight, group_list):
-        group_list = torch.cumsum(group_list, dim=0)
         ctx.save_for_backward(x, weight)
         ctx.group_list = group_list
         x_mxfp8, x_scale = torch_npu.npu_dynamic_mx_quant(
@@ -102,7 +101,6 @@ class GMMFunctionHif8(torch.autograd.Function):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(ctx, x, weight, group_list):
-        group_list = torch.cumsum(group_list, dim=0)
         ctx.save_for_backward(x, weight)
         ctx.group_list = group_list
         x_quant, x_scale, w_quant, w_scale = GMMFunctionHif8.quantize(

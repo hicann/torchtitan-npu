@@ -68,6 +68,9 @@ def _apply_patches():
     new_set.add("deepseek_v4")
     titan_models._supported_models = frozenset(new_set)
 
+    # patching ops
+    from . import ops  # noqa: F401
+
     # module injection
     from .models import deepseek_v32, deepseek_v4  # noqa: F401
 
