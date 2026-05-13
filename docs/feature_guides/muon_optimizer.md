@@ -4,7 +4,7 @@
 
 ## 实现原理
 
-torchtitan-npu 采用了 **Muon + AdamW 混合优化器**策略，核心代码定义在 `torchtitan_npu/patches/optimizer/muon_optimizer.py` 和 `torchtitan_npu/patches/optimizer/muon_distributed.py`。
+torchtitan-npu 采用了 **Muon + AdamW 混合优化器**策略，核心代码定义在 `torchtitan_npu/patches/optimizer/muon_optimizer.py` 。
 
 ### 参数分配策略
 
