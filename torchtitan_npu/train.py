@@ -79,7 +79,7 @@ def _patch_torchtitan_model_reshape_for_broadcast():
     )
 
 
-def _patch_train_step_for_dsv32_indexer_loss():
+def _patch_train_step_for_dsa_indexer_loss():
     _original_train_step = titan_train.Trainer.train_step
 
     def wrapper_train_step(self, *args, **kwargs):
@@ -92,40 +92,7 @@ def _patch_train_step_for_dsv32_indexer_loss():
             and self.model_args.enable_indexer_loss
         ):
             # Import dynamically to avoid circular dependencies
-            from torchtitan_npu.models.deepseek_v32.model.model import (
-                DSAIndexerLossLoggingHelper,
-            )
-
-            # Align logging frequency with the core metrics processor
-            if self.metrics_processor.should_log(self.step):
-                DSAIndexerLossLoggingHelper.track_dsa_indexer_metrics(
-                    total_acc_steps=get_grad_accumulation_steps(self)
-                )
-            else:
-                # Crucial: Clear tracker silently if this step is not being logged
-                # to prevent runaway accumulation of losses across steps.
-                DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
-
-        return result
-
-    # Apply the monkey patch
-    titan_train.Trainer.train_step = wrapper_train_step
-
-
-def _patch_train_step_for_dsv4_indexer_loss():
-    _original_train_step = titan_train.Trainer.train_step
-
-    def wrapper_train_step(self, *args, **kwargs):
-        # Execute the original train_step (which includes gradient accumulation loops)
-        result = _original_train_step(self, *args, **kwargs)
-
-        # Handle indexer loss tracking
-        if (
-            hasattr(self.model_args, "enable_indexer_loss")
-            and self.model_args.enable_indexer_loss
-        ):
-            # Import dynamically to avoid circular dependencies
-            from torchtitan_npu.models.deepseek_v4.model.model import (
+            from torchtitan_npu.models.common.dsa_indexer_loss import (
                 DSAIndexerLossLoggingHelper,
             )
 
@@ -161,17 +128,11 @@ def _patch_init_for_dsa_set_loss_scale():
         scale = 1.0 / float(get_grad_accumulation_steps(self) * loss_degree)
         scale_tensor = torch.tensor(scale, device=self.device, dtype=torch.float32)
 
-        from torchtitan_npu.models.deepseek_v32.model.model import (
-            DSAIndexerLossAutoScaler as DSAIndexerLossAutoScalerV32,
+        from torchtitan_npu.models.common.dsa_indexer_loss import (
+            DSAIndexerLossAutoScaler,
         )
 
-        DSAIndexerLossAutoScalerV32.set_loss_scale(scale_tensor)
-
-        from torchtitan_npu.models.deepseek_v4.model.model import (
-            DSAIndexerLossAutoScaler as DSAIndexerLossAutoScalerV4,
-        )
-
-        DSAIndexerLossAutoScalerV4.set_loss_scale(scale_tensor)
+        DSAIndexerLossAutoScaler.set_loss_scale(scale_tensor)
 
     titan_train.Trainer.__init__ = wrapper_init
 

@@ -11,9 +11,14 @@ import scipy
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.distributed.tensor import DTensor
 from torchtitan.protocols.model import AttentionMasksType
 from torchtitan.protocols.train_spec import ModelProtocol
+
+from torchtitan_npu.models.common.dsa_indexer_loss import (
+    DSAIndexerLoss,
+    DSAIndexerLossAutoScaler,
+    DSAIndexerLossLoggingHelper,
+)
 
 from .args import DeepSeekV4ModelArgs
 from .moe import MoE
@@ -230,154 +235,6 @@ class Indexer(torch.nn.Module):
         self.compressor.init_weights(init_std)
 
 
-class DSAIndexerLossAutoScaler(torch.autograd.Function):
-    """An AutoScaler that triggers the backward pass and scales the grad for DSA indexer loss."""
-
-    # pyrefly: ignore [bad-assignment]
-    main_loss_backward_scale: torch.Tensor = None
-
-    @staticmethod
-    # pyrefly: ignore [bad-override]
-    def forward(ctx, output: torch.Tensor, aux_loss: torch.Tensor):
-        """Preserve the indexer_loss by storing it in the context to avoid garbage collection.
-
-        Args:
-            output (torch.Tensor): The output tensor.
-            aux_loss (torch.Tensor): The indexer loss tensor.
-
-        Returns:
-            torch.Tensor: The output tensor.
-        """
-        ctx.save_for_backward(aux_loss)
-        return output
-
-    @staticmethod
-    # pyrefly: ignore [bad-override]
-    def backward(ctx, grad_output: torch.Tensor):
-        """Compute and scale the gradient for indexer loss.
-
-        Args:
-            grad_output (torch.Tensor): The gradient of the output.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: The gradient of the output, scaled indexer loss
-                                               gradient.
-        """
-        (loss,) = ctx.saved_tensors
-        if DSAIndexerLossAutoScaler.main_loss_backward_scale is None:
-            # pyrefly: ignore [bad-assignment]
-            DSAIndexerLossAutoScaler.main_loss_backward_scale = torch.tensor(
-                1.0, device=loss.device
-            )
-        dsa_indexer_loss_backward_scale = (
-            DSAIndexerLossAutoScaler.main_loss_backward_scale
-        )
-        scaled_dsa_indexer_loss_grad = (
-            torch.ones_like(loss) * dsa_indexer_loss_backward_scale
-        )
-        return grad_output, scaled_dsa_indexer_loss_grad
-
-    @staticmethod
-    def set_loss_scale(scale: torch.Tensor):
-        """set the scale of the indexer loss.
-
-        Args:
-            scale (torch.Tensor): The scale value to set. Please ensure that the scale passed in
-                                  matches the scale of the main_loss.
-        """
-        if DSAIndexerLossAutoScaler.main_loss_backward_scale is None:
-            # pyrefly: ignore [bad-assignment]
-            DSAIndexerLossAutoScaler.main_loss_backward_scale = scale
-        else:
-            DSAIndexerLossAutoScaler.main_loss_backward_scale.copy_(scale)
-
-
-class DSAIndexerLossLoggingHelper:
-    """Helper class for logging DSAIndexer losses."""
-
-    tracker = {}
-
-    @staticmethod
-    def save_loss_to_tracker(
-        loss: torch.Tensor,
-        layer_number: int,
-        num_layers: int,
-    ):
-        """Save the DSA indexer loss for logging.
-        Args:
-            loss (torch.Tensor): The loss tensor.
-            layer_number (int): Layer index of the loss.
-            num_layers (int): The number of total layers.
-        """
-        # Skip DSA indexer loss logging if layer_number is None.
-        if layer_number is None:
-            return
-
-        tracker = DSAIndexerLossLoggingHelper.tracker
-        if "values" not in tracker:
-            tracker["values"] = torch.zeros(num_layers, device=loss.device)
-        tracker["values"][layer_number - 1] += (
-            loss.to_local().detach() if isinstance(loss, DTensor) else loss.detach()
-        )
-
-    @staticmethod
-    def clean_loss_in_tracker():
-        """Clear the DSA indexer losses."""
-        tracker = DSAIndexerLossLoggingHelper.tracker
-        tracker["values"].zero_()
-
-    @staticmethod
-    def track_dsa_indexer_metrics(total_acc_steps: int):
-        """Track the DSA Indexer metrics for logging."""
-        tracker = DSAIndexerLossLoggingHelper.tracker
-        if "values" not in tracker:
-            return
-        das_indexer_losses = tracker["values"]
-        das_indexer_num_layers = das_indexer_losses.shape[0]
-        loss = das_indexer_losses.sum() / das_indexer_num_layers / total_acc_steps
-        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
-        logger.info(f"indexer loss: {loss.item()}")
-
-
-class DSAIndexerLoss(torch.nn.Module):
-    """Compute dsa indexer loss at sparse training stage
-    Reference: https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/DeepSeek_V3_2.pdf
-    Args:
-        selected_main_attn_dist: Q dist
-        index_score: P dist
-        topk_indices: Selected top-K indices for sparse phase
-        loss_scale: Dsa indexer loss scale
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-
-    def forward(
-        self,
-        selected_main_attn_dist,
-        index_score,
-        topk_indices,
-        loss_scale,
-    ):
-
-        index_score = F.softmax(index_score, dim=-1, dtype=torch.float32)
-
-        # considering only the selected token
-        selected_main_attn_dist = F.normalize(selected_main_attn_dist, p=1, dim=-1)
-        loss = (
-            F.kl_div(
-                (index_score + 1e-10).log(),
-                selected_main_attn_dist + 1e-10,
-                reduction="none",
-            )
-            .sum(dim=-1)
-            .mean()
-        )
-        loss *= loss_scale
-
-        return loss
-
-
 class GetAttnScores(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -421,7 +278,7 @@ class LiLoss(torch.nn.Module):
         self.softmax_scale = softmax_scale
         self.compress_ratio = compress_ratio
         self.get_attn_scores = GetAttnScores()
-        self.compute_dsa_indexer_loss = DSAIndexerLoss()
+        self.compute_dsa_indexer_loss = DSAIndexerLoss(eps=1e-10)
         self.layer_id = layer_id
         self.n_layers = n_layers
 

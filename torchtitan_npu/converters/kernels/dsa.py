@@ -10,9 +10,7 @@ import torch.nn as nn
 
 import torch_npu
 
-from torchtitan_npu.patches.torchtitan.activation_checkpoint import (
-    _indexer_loss_need_compute,
-)
+from torchtitan_npu.models.common.dsa_indexer_loss import DSAIndexerLossLoggingHelper
 
 from ..base_converter import BaseConverter
 from ..convert_utils import replace_methods
@@ -46,6 +44,8 @@ class SparseLightningIndexerKLLoss(nn.Module):
         sparse_mode=3,
         pre_tokens=65536,
         next_tokens=65536,
+        layer_number=None,
+        num_layers=0,
     ):
         """NPU Sparse Lightning Indexer KL Divergence Loss Function"""
         bsz = query.shape[0]
@@ -59,6 +59,8 @@ class SparseLightningIndexerKLLoss(nn.Module):
             topk_indices,
             softmax_max,
             softmax_sum,
+            layer_number,
+            num_layers,
             scale_value,
             query_rope,
             key_rope,
@@ -94,6 +96,8 @@ class LILossTrain(torch.autograd.Function):
         sparse_indices,
         softmax_max,
         softmax_sum,
+        layer_number=None,
+        num_layers=0,
         scale_value=1,
         query_rope=None,
         key_rope=None,
@@ -104,87 +108,86 @@ class LILossTrain(torch.autograd.Function):
         pre_tokens=65536,
         next_tokens=65536,
     ):
-        """
-        Forward pass: compute the total loss by processing hidden states in chunks.
-        Compute LI Loss only during the recomputation phase to avoid performance overhead.
-        Use a dummy placeholder tensor during the forward phase to maintain a consistent
-        computational graph for activation checkpointing.
+        ctx.save_for_backward(
+            query,
+            key,
+            query_indexer,
+            key_indexer,
+            weights,
+            sparse_indices,
+            softmax_max,
+            softmax_sum,
+            query_rope,
+            key_rope,
+        )
+        ctx.layer_number = layer_number
+        ctx.num_layers = num_layers
+        ctx.scale_value = scale_value
+        ctx.layout = layout
+        ctx.sparse_mode = sparse_mode
+        ctx.pre_tokens = pre_tokens
+        ctx.next_tokens = next_tokens
+        ctx.actual_seq_qlen = actual_seq_qlen
+        ctx.actual_seq_klen = actual_seq_klen
 
-        Args:
-            ctx: Context object used to save tensors for backward pass.
-            query (Tensor): Required. Represents the Attention query. Shapes: (B, S1, N1, D), (T1, N1, D)
-            key (Tensor): Required. Represents the Attention key. Shapes: (B, S2, N2, D), (T2, N2, D)
-            query_indexer (Tensor): Required. Input query for the lightning_indexer forward pass.
-            key_indexer (Tensor): Required. Input key for the lightning_indexer forward pass.
-            weights (Tensor): Required. Weight coefficients of lightning_indexer.
-            sparse_indices (Tensor): Required. Token indices of sorted key and key_index.
-            softmax_max (Tensor): Required. Maximum values from Attention softmax results.
-            softmax_sum (Tensor): Required. Sum values from Attention softmax results.
-            scale_value (float): Required scaling coefficient.
-            query_rope (Tensor, optional): RoPE information for query in MLA architecture.
-            key_rope (Tensor, optional): RoPE information for key in MLA architecture.
-            actual_seq_qlen (list[int], optional): Required in TND layout. Cumulative sequence lengths for query.
-            actual_seq_klen (list[int], optional): Required in TND layout. Cumulative sequence lengths for key.
-            layout (str, optional): Input data layout format. Supported: "BSND", "TND". Default: "BSND".
-            sparse_mode (int, optional): Sparse computation mode. Default: 3.
-            pre_tokens (int, optional): Number of preceding tokens for sparse Attention. Default: 65536.
-            next_tokens (int, optional): Number of succeeding tokens for sparse Attention. Default: 65536.
-        Returns:
-            d_query_index (Tensor): Gradient of query_index.
-            d_key_index (Tensor): Gradient of key_index.
-            d_weights (Tensor): Gradient of weights.
-            loss (Tensor): Difference between network forward output and golden value.
-        """
-
-        if _indexer_loss_need_compute():
-            (
-                d_query_index,
-                d_key_index,
-                d_weights,
-                loss,
-            ) = torch_npu.npu_sparse_lightning_indexer_grad_kl_loss(
-                query,
-                key,
-                query_indexer,
-                key_indexer,
-                weights,
-                sparse_indices,
-                softmax_max,
-                softmax_sum,
-                scale_value=scale_value,
-                query_rope=query_rope,
-                key_rope=key_rope,
-                actual_seq_qlen=actual_seq_qlen,
-                actual_seq_klen=actual_seq_klen,
-                layout=layout,
-                sparse_mode=sparse_mode,
-                pre_tokens=pre_tokens,
-                next_tokens=next_tokens,
-            )
-        else:
-            d_query_index = torch.zeros_like(query_indexer)
-            d_key_index = torch.zeros_like(key_indexer)
-            d_weights = torch.zeros_like(weights)
-            loss = torch.zeros(1, dtype=torch.float32, device=query.device)
-
-        # Save computed gradients for use in backward pass
-        ctx.save_for_backward(d_query_index, d_key_index, d_weights)
-        return loss[0]
+        # Return dummy loss during fwd, real operation is postponed to bwd
+        # to avoid redundant computation when activation checkpointing is enabled.
+        return torch.zeros(1, dtype=torch.float32, device=query.device)[0]
 
     @staticmethod
     def backward(ctx, *grad_output) -> tuple:
-        d_query_index, d_key_index, d_weights = ctx.saved_tensors
+        (
+            query,
+            key,
+            query_indexer,
+            key_indexer,
+            weights,
+            sparse_indices,
+            softmax_max,
+            softmax_sum,
+            query_rope,
+            key_rope,
+        ) = ctx.saved_tensors
+
+        (
+            d_query_index,
+            d_key_index,
+            d_weights,
+            loss,
+        ) = torch_npu.npu_sparse_lightning_indexer_grad_kl_loss(
+            query,
+            key,
+            query_indexer,
+            key_indexer,
+            weights,
+            sparse_indices,
+            softmax_max,
+            softmax_sum,
+            scale_value=ctx.scale_value,
+            query_rope=query_rope,
+            key_rope=key_rope,
+            actual_seq_qlen=ctx.actual_seq_qlen,
+            actual_seq_klen=ctx.actual_seq_klen,
+            layout=ctx.layout,
+            sparse_mode=ctx.sparse_mode,
+            pre_tokens=ctx.pre_tokens,
+            next_tokens=ctx.next_tokens,
+        )
         if grad_output[0] != 1.0:
             d_query_index = d_query_index * grad_output[0]
             d_key_index = d_key_index * grad_output[0]
             d_weights = d_weights * grad_output[0]
+        bsz, sq = query.shape[0], query.shape[1]
+        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+            loss[0] / (bsz * sq), ctx.layer_number, ctx.num_layers
+        )
         backward_grads = (
             None,
             None,
             d_query_index,
             d_key_index,
             d_weights,
-            *([None] * 12),
+            *([None] * 14),
         )
         return backward_grads
 
@@ -282,9 +285,12 @@ def dsa_forward(
         actual_seq_qlen=None,
         actual_seq_klen=None,
         layout="BSND",
+        layer_number=self.layer_number,
+        num_layers=self.num_layers,
     )
     output = output.transpose(1, 2)
-    return loss, output  # pyrefly: ignore [bad-return]
+    # pyrefly: ignore [bad-return]
+    return loss, output
 
 
 @register_npu_converter("npu_dsa")
@@ -314,11 +320,12 @@ class DSAKernel(BaseConverter):
             "  Only matrix absorb mode is supported, and LI Loss is enabled by default."
         )
 
-        # If tp is no enabled, then the indexer_loss patch in deepseek_v32_parallelize.py won't be applied
+        # If tp is not enabled, then the indexer_loss patch in deepseek_v32/parallelize.py won't be applied
         # The patch is applied here as a supplement
-        # pyrefly: ignore [not-callable]
-        for transformer_block in model.layers.values():
-            # pyrefly: ignore [missing-attribute]
+        # pyrefly: ignore [not-callable, bad-argument-type]
+        num_layers = len(model.layers)
+        # pyrefly: ignore [missing-attribute]
+        for layer_id, transformer_block in model.layers.named_children():
             inner_attention = transformer_block.attention.inner_attention
             if not isinstance(
                 inner_attention.compute_dsa_indexer_loss, SparseLightningIndexerKLLoss
@@ -326,4 +333,6 @@ class DSAKernel(BaseConverter):
                 inner_attention.compute_dsa_indexer_loss = (
                     SparseLightningIndexerKLLoss()
                 )
+            inner_attention.layer_number = int(layer_id)
+            inner_attention.num_layers = num_layers
         return count

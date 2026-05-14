@@ -17,6 +17,12 @@ from torch.nn.attention import sdpa_kernel, SDPBackend
 from torchtitan.models.deepseek_v3.model.model import DeepSeekV3Model, TransformerBlock
 from torchtitan.protocols.model import AttentionMasksType
 
+from torchtitan_npu.models.common.dsa_indexer_loss import (
+    DSAIndexerLoss,
+    DSAIndexerLossAutoScaler,
+    DSAIndexerLossLoggingHelper,
+)
+
 from torchtitan_npu.train import reshape_for_broadcast
 from .args import DeepSeekV32ModelArgs
 
@@ -175,139 +181,6 @@ class Indexer(torch.nn.Module):
         for linear in linear_list:
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
         self.k_norm.reset_parameters()
-
-
-LOSS_SCALE = torch.tensor(1.0)
-
-
-# Derived from MindSpeed,
-# https://gitcode.com/Ascend/MindSpeed-LLM/blob/master/mindspeed_llm/tasks/models/transformer/dsa_indexer.py
-class DSAIndexerLossAutoScaler(torch.autograd.Function):
-    """An AutoScaler that triggers the backward pass and scales the grad for DSA indexer loss."""
-
-    # pyrefly: ignore [bad-assignment]
-    main_loss_backward_scale: torch.Tensor = None
-
-    @staticmethod
-    # pyrefly: ignore [bad-override]
-    def forward(ctx, output: torch.Tensor, aux_loss: torch.Tensor):
-        """Preserve the indexer_loss by storing it in the context to avoid garbage collection.
-
-        Args:
-            output (torch.Tensor): The output tensor.
-            aux_loss (torch.Tensor): The indexer loss tensor.
-
-        Returns:
-            torch.Tensor: The output tensor.
-        """
-        ctx.save_for_backward(aux_loss)
-        return output
-
-    @staticmethod
-    # pyrefly: ignore [bad-override]
-    def backward(ctx, grad_output: torch.Tensor):
-        """Compute and scale the gradient for indexer loss.
-
-        Args:
-            grad_output (torch.Tensor): The gradient of the output.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: The gradient of the output, scaled indexer loss
-                                               gradient.
-        """
-        (loss,) = ctx.saved_tensors
-        LOSS_SCALE.to(device=loss.device)
-        scaled_dsa_indexer_loss_grad = torch.ones_like(loss) * LOSS_SCALE
-        return grad_output, scaled_dsa_indexer_loss_grad
-
-    @classmethod
-    def set_loss_scale(cls, scale: torch.Tensor) -> None:
-        global LOSS_SCALE
-        LOSS_SCALE = scale
-
-
-class DSAIndexerLossLoggingHelper:
-    """Helper class for logging DSAIndexer losses."""
-
-    tracker = {}
-
-    @staticmethod
-    def save_loss_to_tracker(
-        loss: torch.Tensor,
-        layer_number: int,
-        num_layers: int,
-    ):
-        """Save the DSA indexer loss for logging.
-        Args:
-            loss (torch.Tensor): The loss tensor.
-            layer_number (int): Layer index of the loss.
-            num_layers (int): The number of total layers.
-        """
-        # Skip DSA indexer loss logging if layer_number is None.
-        if layer_number is None:
-            return
-
-        tracker = DSAIndexerLossLoggingHelper.tracker
-        if "values" not in tracker:
-            tracker["values"] = torch.zeros(num_layers, device=loss.device)
-        loss_val = loss.detach()
-        if hasattr(loss_val, "to_local"):
-            loss_val = loss_val.to_local()
-        tracker["values"][layer_number - 1] += loss_val
-
-    @staticmethod
-    def clean_loss_in_tracker():
-        """Clear the DSA indexer losses."""
-        tracker = DSAIndexerLossLoggingHelper.tracker
-        tracker["values"].zero_()
-
-    @staticmethod
-    def track_dsa_indexer_metrics(total_acc_steps: int):
-        """Track the DSA Indexer metrics for logging."""
-        tracker = DSAIndexerLossLoggingHelper.tracker
-        if "values" not in tracker:
-            return
-        das_indexer_losses = tracker["values"]
-        das_indexer_num_layers = das_indexer_losses.shape[0]
-        loss = das_indexer_losses.sum() / das_indexer_num_layers / total_acc_steps
-        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
-        logger.info(f"indexer loss: {loss.item()}")
-
-
-class DSAIndexerLoss(torch.nn.Module):
-    """Compute dsa indexer loss at sparse training stage
-    Reference: https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/DeepSeek_V3_2.pdf
-    Args:
-        main_attn_dist: Q dist
-        index_score: P dist
-        topk_indices: Selected top-K indices for sparse phase
-        loss_scale: Dsa indexer loss scale
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-
-    def forward(
-        self,
-        selected_main_attn_dist,
-        index_score,
-        topk_indices,
-        loss_scale,
-    ):
-        index_score = F.softmax(index_score, dim=-1, dtype=torch.float32)
-        # considering only the selected token
-        selected_main_attn_dist = F.normalize(selected_main_attn_dist, p=1, dim=-1)
-        loss = (
-            F.kl_div(
-                (index_score + 1e-8).log(),
-                selected_main_attn_dist + 1e-8,
-                reduction="none",
-            )
-            .sum(dim=-1)
-            .mean()
-        )
-        loss *= loss_scale
-        return loss
 
 
 def get_attn_scores(

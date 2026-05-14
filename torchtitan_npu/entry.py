@@ -1,4 +1,8 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+# This file is derived from torchtitan,
+# https://github.com/pytorch/torchtitan/blob/v0.2.2/torchtitan/train.py
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -7,15 +11,10 @@ import os
 
 import torch
 
-import torchtitan.distributed.activation_checkpoint as activation_checkpoint_module
-
 from torchtitan.config.manager import ConfigManager
 from torchtitan.tools.logging import init_logger, logger
 from torchtitan.train import Trainer
 
-from torchtitan_npu.patches.torchtitan.activation_checkpoint import (
-    _patched_apply_full_ac,
-)
 from torchtitan_npu.train import (
     _patch_for_garbage_collection_run,
     _patch_for_parallel_dims_build_mesh,
@@ -27,13 +26,6 @@ if __name__ == "__main__":
     config_manager = ConfigManager()
     config = config_manager.parse_args()
     trainer: Trainer | None = None
-
-    if config.compile.enable and config.activation_checkpoint != "none":
-        logger.warning(
-            "There might be performance issues with activation checkpointing and torch.compile enabled!"
-        )
-    else:
-        activation_checkpoint_module._apply_full_ac = _patched_apply_full_ac
 
     _patch_for_garbage_collection_run()
     _patch_for_parallel_dims_build_mesh()
@@ -77,26 +69,13 @@ if __name__ == "__main__":
                     "Please add 'npu_bypass_triton_codegen' to model.converters in your config."
                 )
 
-    if config.model.name == "deepseek_v32":
+    if config.model.name in ("deepseek_v32", "deepseek_v4"):
         from torchtitan_npu.train import (
             _patch_init_for_dsa_set_loss_scale,
-            _patch_train_step_for_dsv32_indexer_loss,
+            _patch_train_step_for_dsa_indexer_loss,
         )
 
-        _patch_train_step_for_dsv32_indexer_loss()
-        _patch_init_for_dsa_set_loss_scale()
-
-        from torchtitan_npu.train import _patch_for_train_npu_memory
-
-        _patch_for_train_npu_memory()
-
-    if config.model.name == "deepseek_v4":
-        from torchtitan_npu.train import (
-            _patch_init_for_dsa_set_loss_scale,
-            _patch_train_step_for_dsv4_indexer_loss,
-        )
-
-        _patch_train_step_for_dsv4_indexer_loss()
+        _patch_train_step_for_dsa_indexer_loss()
         _patch_init_for_dsa_set_loss_scale()
 
         from torchtitan_npu.train import _patch_for_train_npu_memory

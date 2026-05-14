@@ -238,6 +238,8 @@ def dsa_forward_with_cp(
         actual_seq_klen=None,
         layout="BSND",
         sparse_mode=3,  # mask is rightDownCausal mode
+        layer_number=self.layer_number,
+        num_layers=self.num_layers,
     )
     output = output.transpose(1, 2)
     # pyrefly: ignore [bad-return]
