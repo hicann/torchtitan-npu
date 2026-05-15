@@ -61,9 +61,9 @@ def hc_split_sinkhorn_torch(weight, branch_alpha, branch_beta, cfg):
         + cfg.eps
     )
     h_post = 2 * F.sigmoid(
-        h_post * branch_alpha[1] + branch_beta[ns:2 * ns].unsqueeze(0).unsqueeze(0)
+        h_post * branch_alpha[1] + branch_beta[ns : 2 * ns].unsqueeze(0).unsqueeze(0)
     )
-    h_res = h_res * branch_alpha[2] + branch_beta[2 * ns:].view(ns, ns).unsqueeze(
+    h_res = h_res * branch_alpha[2] + branch_beta[2 * ns :].view(ns, ns).unsqueeze(
         0
     ).unsqueeze(0)
 

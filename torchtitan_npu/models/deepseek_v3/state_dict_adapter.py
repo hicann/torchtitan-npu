@@ -11,8 +11,6 @@ from typing import Any
 
 import torch
 from torch.distributed.tensor import distribute_tensor, DTensor
-
-from torchtitan.models.deepseek_v3 import DeepSeekV3StateDictAdapter
 from torchtitan.models.utils import MoEStateDictAdapter
 
 from torchtitan_npu.tools.weight_utils import (
@@ -21,44 +19,6 @@ from torchtitan_npu.tools.weight_utils import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-class DeepSeekV3StateDictAdapterNpu(DeepSeekV3StateDictAdapter):
-    def __init__(self, model_config, hf_assets_path: str | None):
-        super().__init__(model_config, hf_assets_path)
-
-        self.use_gmm = any(
-            layer_cfg.moe is not None and layer_cfg.moe.experts.use_grouped_mm
-            for layer_cfg in model_config.layers
-        )
-        self._input_format = "hf"
-        self._input_expert_format = "standard"
-
-    def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
-        if self._input_format == "dcp":
-            return state_dict
-        has_w13 = any(".moe.experts.w13" in k for k in state_dict.keys())
-        if has_w13:
-            working_state = _split_w13_for_mapping(state_dict)
-            return super().to_hf(working_state)
-        else:
-            return super().to_hf(state_dict)
-
-    def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
-        filtered = {
-            k: v
-            for k, v in hf_state_dict.items()
-            if not k.endswith(".weight_scale_inv")
-        }
-
-        if self._input_format == "hf":
-            state_dict = super().from_hf(filtered)
-        else:
-            state_dict = filtered
-        target = "gmm" if self.use_gmm else "standard"
-        state_dict = convert_expert_format(state_dict, target)
-
-        return state_dict
 
 
 class DeepSeek16BStateDictAdapterNpu(MoEStateDictAdapter):

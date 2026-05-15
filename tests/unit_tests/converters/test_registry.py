@@ -3,79 +3,58 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from unittest.mock import patch
-
-from torchtitan_npu.converters.registry import ConverterRegistry, PatchInfo, registry
+from torchtitan_npu.converters.npu_registry import registry
 
 
-class DummyPatch:
-    SUPPORTED_MODELS = {"dummy_model"}
+class DummyModelCustomConfig:
+    name: str = "dummy"
 
 
-def _run_register_case(register_name, *, supported_models=None):
+def _run_register_case(register_name):
     calls = []
-    test_registry = ConverterRegistry()
-    with patch.object(test_registry, "_patches", {}), patch.object(
-        test_registry,
-        "_register_as_model_converter",
-        lambda name, patch_cls, registered_models: calls.append(
-            (name, patch_cls, registered_models)
-        ),
-    ):
-        if supported_models is None:
-            decorated_cls = test_registry.register(register_name)(DummyPatch)
-        else:
-            decorated_cls = test_registry.register(
-                register_name,
-                supported_models=supported_models,
-            )(DummyPatch)
-        patch_info = test_registry.get(register_name)
+    test_registry = registry()
 
-    return decorated_cls, patch_info, calls
+    original_register = test_registry._register_as_model_converter
+
+    def mock_register(name, config):
+        calls.append((name, config))
+
+    test_registry._register_as_model_converter = mock_register
+
+    decorated_config = test_registry.register(register_name)(DummyModelCustomConfig)
+    config = test_registry.get(register_name)
+
+    test_registry._register_as_model_converter = original_register
+
+    return decorated_config, config, calls
 
 
 def test_registry_is_singleton():
-    registry1 = ConverterRegistry()
-    registry2 = ConverterRegistry()
+    registry1 = registry()
+    registry2 = registry()
 
     assert registry1 is registry2
-    assert registry1 is registry
 
 
-def test_patch_info_is_dataclass_with_expected_defaults():
-    patch_info = PatchInfo(name="dummy", patch_cls=DummyPatch)
+def test_register_sets_name_and_stores_config():
+    decorated_config, config, calls = _run_register_case("unit_dummy")
 
-    assert patch_info.name == "dummy"
-    assert patch_info.patch_cls is DummyPatch
-    assert patch_info.supported_models == {"*"}
-
-
-def test_register_uses_patch_supported_models_by_default():
-    decorated_cls, _, calls = _run_register_case("unit_dummy")
-
-    assert decorated_cls is DummyPatch
-    assert calls == [("unit_dummy", DummyPatch, {"dummy_model"})]
+    assert decorated_config is DummyModelCustomConfig
+    assert config is not None
+    assert config.name == "unit_dummy"
+    assert len(calls) == 1
+    assert calls[0][0] == "unit_dummy"
+    assert calls[0][1] is DummyModelCustomConfig
 
 
-def test_register_supports_explicit_supported_models_override():
-    decorated_cls, patch_info, calls = _run_register_case(
-        "unit_override",
-        supported_models={"model_a", "model_b"},
-    )
-
-    assert decorated_cls is DummyPatch
-    assert patch_info is not None
-    assert patch_info.supported_models == {"model_a", "model_b"}
-    assert calls == [("unit_override", DummyPatch, {"model_a", "model_b"})]
-
-
-def test_get_returns_none_for_unknown_patch():
-    assert registry.get("definitely_missing_patch") is None
+def test_get_returns_none_for_unknown_config():
+    assert registry.get("definitely_missing_config") is None
 
 
 def test_core_converter_registrations_exist():
-    for name in ["npu_dsa", "npu_rms_norm", "npu_rope"]:
-        patch_info = registry.get(name)
-        assert patch_info is not None, f"{name} should be registered"
-        assert patch_info.name == name
-        assert patch_info.patch_cls is not None
+    expected_names = ["npu_dsa", "npu_rms_norm", "npu_rope", "npu_permute"]
+
+    for name in expected_names:
+        config = registry.get(name)
+        assert config is not None, f"{name} should be registered"
+        assert config.name == name

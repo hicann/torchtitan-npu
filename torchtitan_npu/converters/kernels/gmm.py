@@ -12,14 +12,20 @@
 import logging
 
 import torch
-
 import torch_npu
 from torch import nn
 from torch.distributed.tensor import DTensor
 
-from ..base_converter import BaseConverter
-from ..convert_utils import replace_functions, replace_methods
-from ..registry import register_npu_converter
+from torchtitan.models.common.moe import GroupedExperts
+
+from torchtitan_npu.converters.convert_utils import replace_module_with_name
+from torchtitan_npu.converters.model_custom_interface import (
+    ModelCustomConfig,
+    ModelCustomConverter,
+    StateDictUpdater,
+)
+from torchtitan_npu.converters.npu_registry import register_model_converter
+from torchtitan_npu.tools.weight_utils import _split_w13_for_mapping, fuse_experts
 
 logger = logging.getLogger(__name__)
 
@@ -44,12 +50,18 @@ def _run_experts_grouped_mm(
     w2: torch.Tensor,
     _w3: torch.Tensor,
     x: torch.Tensor,
-    num_tokens_per_expert: torch.Tensor | None,
+    num_tokens_per_expert: torch.Tensor,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     # pyrefly: ignore [missing-attribute]
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int64)
 
     h = npu_grouped_mm(x.bfloat16(), w13.bfloat16().transpose(-2, -1), offsets)
+    if swiglu_limit is not None:
+        gate, up = h.chunk(2, -1)
+        up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
+        gate = torch.clamp(gate, max=swiglu_limit)
+        h = torch.cat([gate, up], dim=-1)
     h = torch_npu.npu_swiglu(h, dim=-1)
     out = npu_grouped_mm(h, w2.bfloat16().transpose(-2, -1), offsets).type_as(x)
 
@@ -84,8 +96,11 @@ def npu_grouped_experts_forward(
         w13 = self.w13
         tp_group = None
 
+    # Refactor this, only DSv4 inject this attribute to its experts.
+    swiglu_limit = getattr(self, "swiglu_limit", None)
+
     # pyrefly: ignore [bad-argument-type]
-    out = _run_experts_grouped_mm(w13, w2, None, x, num_tokens_per_expert)
+    out = _run_experts_grouped_mm(w13, w2, None, x, num_tokens_per_expert, swiglu_limit)
 
     if is_tp and tp_group is not None:
         import torch.distributed as dist
@@ -113,11 +128,40 @@ def npu_grouped_experts_init_weights(self, init_std: float):
             nn.init.normal_(w, mean=0.0, std=init_std)
 
 
-class NpuGroupedExperts(nn.Module):
-    def __init__(self, module: nn.Module):
-        super().__init__()
-        self.w2 = module.w2
-        self.w13 = module.w13
+class NpuGroupedExperts(GroupedExperts):
+    def __init__(
+        self,
+        parent: GroupedExperts,
+    ):
+        self.__dict__.update(parent.__dict__)
+        self.use_grouped_mm = True
+        if self.w1 is not None and self.w3 is not None:
+            # pyrefly: ignore [no-matching-overload]
+            w13_data = torch.empty(
+                self.num_experts,
+                self.w2.shape[2] * 2,
+                self.w2.shape[1],
+                dtype=self.w1.dtype,
+                device=self.w1.device,
+            )
+            self.w13 = nn.Parameter(w13_data)
+            # Add w13 initializer to _param_init if it exists (new torchtitan config system)
+            _param_init = getattr(parent, "_param_init", None)
+            if _param_init is not None:
+                # Use w1's initializer for w13 (combined w1+w3)
+                w1_init = _param_init.get("w1")
+                if w1_init is not None:
+                    _param_init["w13"] = w1_init
+
+            # pyrefly: ignore [bad-assignment]
+            self.w1 = None
+            # pyrefly: ignore [bad-assignment]
+            self.w3 = None
+            # pyrefly: ignore [bad-assignment]
+            parent.w1 = None
+            # pyrefly: ignore [bad-assignment]
+            parent.w3 = None
+            logger.info(f"  NpuGroupedExperts: Created w13 [{w13_data.shape}]")
 
     def forward(
         self,
@@ -126,101 +170,36 @@ class NpuGroupedExperts(nn.Module):
     ) -> torch.Tensor:
         return npu_grouped_experts_forward(self, x, num_tokens_per_expert)
 
+    def init_weights(self, init_std: float):
+        npu_grouped_experts_init_weights(self, init_std)
 
-@register_npu_converter("npu_gmm")
-class GMMKernel(BaseConverter):
 
-    TARGET_PACKAGE = "torchtitan.models.common.moe"
-    TARGET_CLASS = "GroupedExperts"
-
-    @classmethod
-    # pyrefly: ignore [bad-override]
-    def apply(cls, model: nn.Module, model_name: str, **kwargs) -> int:
-
-        replacement_counts = 0
-
-        # 1. Replacing GroupedExperts methods
-        replacement_counts += replace_methods(
-            class_name=cls.TARGET_CLASS,
-            method_name="forward",
-            new_method=npu_grouped_experts_forward,
-            package=cls.TARGET_PACKAGE,
-        )
-
-        replacement_counts += replace_methods(
-            class_name=cls.TARGET_CLASS,
-            method_name="init_weights",
-            new_method=npu_grouped_experts_init_weights,
-            package=cls.TARGET_PACKAGE,
-        )
-
-        # 2. Replacing module function _run_experts_grouped_mm
-        func_replacements = replace_functions(
-            func_name="_run_experts_grouped_mm",
-            new_func=_run_experts_grouped_mm,
-            package=cls.TARGET_PACKAGE,
-        )
-        replacement_counts += func_replacements
-
-        # Initialize w13
-        cls._change_existing_instances(model)
-
-        # pyrefly: ignore [bad-return]
-        return replacement_counts
-
-    @classmethod
-    def _change_existing_instances(cls, model: nn.Module):
-        """Traverse the model and convert w1+w3 of the existing GroupedExperts into w13."""
+class NpuGroupedExpertConverter(ModelCustomConverter):
+    def convert(self, model: nn.Module):
         for name, module in model.named_modules():
-            class_name = type(module).__name__
-            if (
-                "GroupedExperts" not in class_name
-                and cls.TARGET_CLASS not in class_name
-            ):
+            if not isinstance(module, GroupedExperts):
                 continue
-            w1 = getattr(module, "w1", None)
-            w3 = getattr(module, "w3", None)
+            replace_module_with_name(model, name, NpuGroupedExperts(module))
 
-            if w1 is not None and w3 is not None:
-                try:
-                    cls._create_w13_from_w1_w3(module, name)
-                except Exception as e:
-                    logger.warning(f"Failed to convert {name}: {e}")
-            else:
-                logger.warning(f"  {name}: Missing w1/w3, skipping")
-        return
+
+class GMMStateDictUpdater(StateDictUpdater):
+    @classmethod
+    def to_hf(cls, state_dict):
+        has_w13 = any(".moe.experts.w13" in k for k in state_dict.keys())
+        if has_w13:
+            state_dict = _split_w13_for_mapping(state_dict)
+        return state_dict
 
     @classmethod
-    def _create_w13_from_w1_w3(cls, module: nn.Module, module_name: str):
-        """Create parameter w13 from w1"""
-        w1 = module.w1
+    def from_hf(cls, state_dict):
+        filtered = {
+            k: v for k, v in state_dict.items() if not k.endswith(".weight_scale_inv")
+        }
 
-        # pyrefly: ignore [bad-index]
-        num_experts = w1.shape[0]
-        # pyrefly: ignore [bad-index]
-        hidden_dim = w1.shape[1]
-        # pyrefly: ignore [bad-index]
-        dim = w1.shape[2]
+        return fuse_experts(filtered)
 
-        # pyrefly: ignore [no-matching-overload]
-        w13_data = torch.empty(
-            num_experts, hidden_dim * 2, dim, dtype=w1.dtype, device=w1.device
-        )
-        module.register_parameter("w13", nn.Parameter(w13_data))
-        # pyrefly: ignore [bad-argument-type]
-        module.use_grouped_mm = True
 
-        # pyrefly: ignore [bad-argument-type]
-        module.w1 = None
-        # pyrefly: ignore [bad-argument-type]
-        module.w3 = None
-
-        # Add w13 initializer to _param_init if it exists (new torchtitan config system)
-        _param_init = getattr(module, "_param_init", None)
-        if _param_init is not None:
-            # Use w1's initializer for w13 (combined w1+w3)
-            w1_init = _param_init.get("w1")
-            if w1_init is not None:
-                _param_init["w13"] = w1_init
-
-        logger.info(f"  {module_name}: Created w13 [{w13_data.shape}]")
+@register_model_converter("npu_gmm")
+class GMMModelConfig(ModelCustomConfig):
+    model_converter = NpuGroupedExpertConverter
+    state_dict_updater = GMMStateDictUpdater

@@ -17,7 +17,7 @@ from torchtitan_npu.config.configs import (
     TrainerConfig,
     TrainingConfig,
 )
-from torchtitan_npu.converters.registry import get_npu_converter_config
+from torchtitan_npu.converters.npu_registry import get_model_converter_config
 from torchtitan_npu.patches.optimizer.swap_optimizer import SwapOptimizersContainer
 
 from . import model_registry
@@ -29,10 +29,10 @@ def deepseek_v3_671b_debug() -> TrainerConfig:
         model_spec=model_registry("671B_debug_16die"),
         model_converters=ModelConvertersContainer.Config(
             converters=[
-                get_npu_converter_config("npu_rms_norm"),
-                get_npu_converter_config("npu_rope"),
-                get_npu_converter_config("npu_permute"),
-                get_npu_converter_config("npu_gmm"),
+                get_model_converter_config("npu_rms_norm"),
+                get_model_converter_config("npu_rope"),
+                get_model_converter_config("npu_permute"),
+                get_model_converter_config("npu_gmm"),
             ],
         ),
         metrics=MetricsProcessor.Config(log_freq=1),

@@ -16,9 +16,9 @@ from torchtitan.models.common.rope import (
     _reshape_for_broadcast_cos_sin,
 )
 
-from ..base_converter import BaseConverter
 from ..convert_utils import replace_functions
-from ..registry import register_npu_converter
+from ..model_custom_interface import ModelCustomConfig, ModelCustomConverter
+from ..npu_registry import register_model_converter
 
 logger = logging.getLogger(__name__)
 
@@ -197,15 +197,7 @@ _ROPE_REPLACEMENTS = {
 }
 
 
-@register_npu_converter("npu_rope")
-class RoPEKernel(BaseConverter):
-    @classmethod
-    def apply(cls, model: nn.Module, model_name: str, **kwargs) -> int:
-        count = 0
-        for func_name, impl in _ROPE_REPLACEMENTS.items():
-            count += cls._replace_one(func_name, impl, model)
-        return count
-
+class NpuRoPEConverter(ModelCustomConverter):
     @classmethod
     def _replace_one(cls, func_name: str, impl: Callable, model: nn.Module) -> int:
         mod = sys.modules.get(_UPSTREAM_ROPE_MODULE)
@@ -230,3 +222,12 @@ class RoPEKernel(BaseConverter):
                 f"skipping replacement"
             )
         return count
+
+    def convert(self, model: nn.Module):
+        for func_name, impl in _ROPE_REPLACEMENTS.items():
+            self._replace_one(func_name, impl, model)
+
+
+@register_model_converter("npu_rope")
+class RoPEModelConfig(ModelCustomConfig):
+    model_converter = NpuRoPEConverter

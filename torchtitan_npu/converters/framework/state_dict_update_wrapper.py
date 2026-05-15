@@ -6,7 +6,7 @@
 import logging
 from typing import Any
 
-from torchtitan.protocols.train_spec import TrainSpec
+from torchtitan.protocols.model_spec import ModelSpec
 
 from torchtitan_npu.converters.model_custom_interface import StateDictUpdater
 
@@ -37,14 +37,14 @@ def get_state_dict_adapter_wrapper(cls):
 
 
 def apply_state_dict_update(
-    updater_cls: type["StateDictUpdater"], train_spec: TrainSpec
+    updater_cls: type["StateDictUpdater"], model_spec: ModelSpec
 ):
-    if not hasattr(train_spec, "state_dict_adapter"):
+    if not hasattr(model_spec, "state_dict_adapter"):
         raise RuntimeError(
             "[StateDictUpdateWrapper] TrainSpec does not have state_dict_adapter."
         )
 
-    state_dict_adapter = train_spec.state_dict_adapter
+    state_dict_adapter = model_spec.state_dict_adapter
     if state_dict_adapter is None:
         raise RuntimeError(
             "[StateDictUpdateWrapper] TrainSpec.state_dict_adapter is None."
@@ -52,7 +52,7 @@ def apply_state_dict_update(
 
     if not hasattr(state_dict_adapter, "_updater_cls_list"):
         adapter_wrapper = get_state_dict_adapter_wrapper(state_dict_adapter)
-        train_spec.state_dict_adapter = adapter_wrapper
+        model_spec.state_dict_adapter = adapter_wrapper
         state_dict_adapter = adapter_wrapper
 
     # pyrefly: ignore [missing-attribute]

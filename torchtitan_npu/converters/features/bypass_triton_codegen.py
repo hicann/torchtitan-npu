@@ -6,17 +6,15 @@
 import logging
 from functools import wraps
 
-import torch
-import torch._inductor.graph
+import torch._inductor.graph as inductor_graph
 import torch.nn as nn
 from torch._inductor.decomposition import decompositions
 from torch._inductor.lowering import lowerings
 
 from torchtitan_npu.patches.torch._inductor.graph import graphlowering_call_function
-
-from ..base_converter import BaseConverter
 from ..convert_utils import find_functions
-from ..registry import register_npu_converter
+from ..model_custom_interface import ModelCustomConfig, ModelCustomConverter
+from ..npu_registry import register_model_converter
 
 logger = logging.getLogger(__name__)
 
@@ -35,14 +33,18 @@ def compile_bypass_fusion(func):
     return wrapper
 
 
-@register_npu_converter("npu_bypass_triton_codegen")
-class BypassTritonCodegenKernel(BaseConverter):
+class BypassTritonCodegenConverter(ModelCustomConverter):
 
     SUPPORTED_MODELS = {"deepseek_v32", "llama3"}
 
-    @classmethod
-    # pyrefly: ignore [bad-override]
-    def apply(cls, model: nn.Module, model_name: str, **kwargs) -> nn.Module:
+    def convert(self, model: nn.Module):
+        if self.model_name not in self.SUPPORTED_MODELS:
+            logger.warning(
+                f"BypassTritonCodegenConverter: model '{self.model_name}' "
+                f"not in supported models {self.SUPPORTED_MODELS}"
+            )
+            return
+
         target = "apply_compile"
         pkg = "torchtitan.models"
         pkg_npu = "torchtitan_npu.models"
@@ -52,7 +54,7 @@ class BypassTritonCodegenKernel(BaseConverter):
             logger.info(
                 "  No matched function apply_compile for this model, continue without patching"
             )
-            return model
+            return
 
         for m in matches:
             m.replace(compile_bypass_fusion(m.func))
@@ -60,8 +62,10 @@ class BypassTritonCodegenKernel(BaseConverter):
         # Lazy imports to avoid requiring NPU hardware at module load time
         from torchtitan_npu.patches.torch_npu._inductor.lowering import fix_npu_inductor
 
-        torch._inductor.graph.GraphLowering.call_function = graphlowering_call_function
+        inductor_graph.GraphLowering.call_function = graphlowering_call_function
         fix_npu_inductor()
 
-        # pyrefly: ignore [bad-return]
-        return len(matches)
+
+@register_model_converter("npu_bypass_triton_codegen")
+class BypassTritonCodegenModelConfig(ModelCustomConfig):
+    model_converter = BypassTritonCodegenConverter

@@ -9,12 +9,25 @@ import logging
 import torch
 import torch.nn as nn
 import torch_npu
-from torch.distributed.tensor import DTensor
+from torch.distributed._functional_collectives import (
+    all_to_all_single,
+    all_to_all_single_autograd,
+)
+from torch.distributed.tensor import DeviceMesh, DTensor
+from torch.distributed.tensor.parallel.style import ParallelStyle
 from torch.distributed.tensor.placement_types import Partial
+from torchtitan.distributed.expert_parallel import ExpertParallel
 
-from ..base_converter import BaseConverter
-from ..convert_utils import replace_methods
-from ..registry import register_npu_converter
+from torchtitan.models.common.moe import MoE
+
+from torchtitan_npu.converters.convert_utils import replace_module_with_name
+from torchtitan_npu.converters.kernels.permutation import NPUMoeTokenUnpermute
+from torchtitan_npu.converters.model_custom_interface import (
+    ModelCustomConfig,
+    ModelCustomConverter,
+    ParallelizePlanUpdater,
+)
+from torchtitan_npu.converters.npu_registry import register_model_converter
 
 logger = logging.getLogger(__name__)
 
@@ -114,17 +127,129 @@ def _npu_moe_forward(self, x):
     return (out + unpermuted).reshape(bs, slen, dim)
 
 
-@register_npu_converter("npu_permute")
-class PermuteKernel(BaseConverter):
+class NpuMoE(MoE):
+    def __init__(
+        self,
+        parent: MoE,
+    ):
+        # Shallow copy of parent's __dict__ is intentional here:
+        # - MoE attributes are primarily PyTorch modules and buffers (weights should be shared)
+        # - Avoids complex dependency on MoE.__init__ parameters (moe_args, dim, hidden_dim)
+        # - Parent instance already has all attributes properly initialized
+        # Note: If MoE had mutable non-module attributes requiring independent state,
+        # we would need explicit attribute copying instead
+        self.__dict__.update(parent.__dict__)
 
-    MOE_PACKAGE = "torchtitan.models.common.moe"
+    def forward(self, x):
+        return _npu_moe_forward(self, x)
 
+
+class NpuPermuteConverter(ModelCustomConverter):
+    def convert(self, model: nn.Module):
+        for name, module in model.named_modules():
+            if not isinstance(module, MoE):
+                continue
+            replace_module_with_name(model, name, NpuMoE(module))
+
+
+class NpuExpertParallel(ExpertParallel):
+    def _token_dispatch(
+        self, mod: nn.Module, inputs: tuple, device_mesh: DeviceMesh
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # annotate module input placements/sharding with input_layouts
+        routed_input, num_tokens_per_expert = inputs
+        ep_degree = device_mesh.shape[0]
+        num_local_experts = num_tokens_per_expert.shape[0] // ep_degree
+
+        # generate the input splits and output splits for all-to-all
+        with torch.no_grad():
+            num_tokens_per_expert_group = all_to_all_single(
+                num_tokens_per_expert,
+                None,
+                None,
+                group=device_mesh.get_group(),
+            )
+            input_splits = (
+                num_tokens_per_expert.view(ep_degree, -1)
+                .sum(dim=1)
+                .to(torch.device("cpu"), non_blocking=True)
+            )
+            # NOTE: this would incur a device-to-host sync
+            output_splits = (
+                num_tokens_per_expert_group.view(ep_degree, -1)
+                .sum(dim=1)
+                .to(torch.device("cpu"), non_blocking=False)
+            )
+            self.input_splits = input_splits.tolist()
+            self.output_splits = output_splits.tolist()
+
+        # perform all-to-all
+        routed_input = all_to_all_single_autograd(
+            routed_input,
+            self.output_splits,
+            self.input_splits,
+            device_mesh.get_group(),
+        )
+
+        # NOTE: After this all-to-all, the routed input is put on proper EP rank.
+        # However, the num_tokens_per_expert_group is not of the final target format
+        # [#tokens for local expert 0, #tokens for local expert 1, ...]
+        # Rather, it is of the format
+        # [#tokens for local expert 0 from EP rank 0, #tokens for local expert 1 from EP rank 0, ...,
+        #  #tokens for local expert 0 from EP rank 1, #tokens for local expert 1 from EP rank 1, ...]
+        # We need to perform another shuffle to get the correct layout
+        indices = (
+            torch.arange(
+                num_local_experts,
+                dtype=torch.int64,
+                device=routed_input.device,
+            )
+            .repeat(ep_degree)
+            .repeat_interleave(
+                num_tokens_per_expert_group.view(-1),
+                output_size=sum(self.output_splits),
+            )
+        )
+
+        routed_input, self.permuted_indices = torch_npu.npu_moe_token_permute(
+            routed_input, indices
+        )
+
+        num_tokens_per_expert_group = num_tokens_per_expert_group.view(
+            ep_degree, -1
+        ).sum(0)
+
+        return routed_input, num_tokens_per_expert_group
+
+    def _token_combine(
+        self, mod: nn.Module, routed_output: torch.Tensor, device_mesh: DeviceMesh
+    ) -> torch.Tensor:
+        # Using NPUMoeTokenUnpermute.apply and npu_moe_token_unpermute is equivalent here,
+        # and avoid storing tensor routed_output during backpropagation.
+        routed_output = NPUMoeTokenUnpermute.apply(
+            routed_output, self.permuted_indices, routed_output.shape
+        )
+        routed_output = all_to_all_single_autograd(
+            routed_output,
+            self.input_splits,
+            self.output_splits,
+            device_mesh.get_group(),
+        )
+        return routed_output
+
+
+class NpuParallelizePlanUpdater(ParallelizePlanUpdater):
     @classmethod
-    # pyrefly: ignore [bad-override]
-    def apply(cls, model: nn.Module, model_name: str, **kwargs) -> int:
-        pkg = cls.MOE_PACKAGE
+    def update(
+        cls, parallelize_plan: ParallelStyle | dict[str, ParallelStyle] | None
+    ) -> ParallelStyle | dict[str, ParallelStyle] | None:
+        """Update the layer plan"""
+        if isinstance(parallelize_plan, ExpertParallel):
+            return NpuExpertParallel()
+        return parallelize_plan
 
-        count = replace_methods("MoE", "forward", _npu_moe_forward, package=pkg)
 
-        # pyrefly: ignore [bad-return]
-        return count
+@register_model_converter("npu_permute")
+class PermuteModelConfig(ModelCustomConfig):
+    model_converter = NpuPermuteConverter
+    parallelize_plan_updater = NpuParallelizePlanUpdater

@@ -3,33 +3,42 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import torchtitan.protocols.train_spec as train_spec_module
+from torchtitan.config import Configurable
+from torchtitan.distributed import ParallelDims
+from torchtitan.protocols.model_spec import ModelSpec
+from torchtitan.trainer import Trainer
 
-from .framework.model_custom_config_registry import ConverterRegistry
+from .framework.model_custom_config_registry import registry as npu_registry
 
-registry = ConverterRegistry()
+
+def registry():
+    return npu_registry
 
 
 def register_model_converter(name: str):
-    return registry.register(name)
+    return npu_registry.register(name)
 
 
-G_CUR_USING_TRAIN_SPEC: train_spec_module.TrainSpec | None = None
+def get_model_converter_config(name: str) -> Configurable.Config | None:
+    return npu_registry.get_config(name)
 
 
-def get_using_train_spec() -> train_spec_module.TrainSpec | None:
-    return G_CUR_USING_TRAIN_SPEC
+G_USING_TRAIN_CONFIG: Trainer.Config | None = None
 
 
-_original_get_train_spec = train_spec_module.get_train_spec
+def get_using_model_spec() -> ModelSpec:
+    if G_USING_TRAIN_CONFIG is None:
+        raise RuntimeError("G_USING_TRAIN_CONFIG must be set before using.")
+    return G_USING_TRAIN_CONFIG.model_spec
 
 
-def get_train_spec_wrapper(name: str) -> train_spec_module.TrainSpec:
-    train_spec = _original_get_train_spec(name)
-    global G_CUR_USING_TRAIN_SPEC
-    G_CUR_USING_TRAIN_SPEC = train_spec
-
-    return train_spec
+_original_init_distributed = Trainer.init_distributed
 
 
-train_spec_module.get_train_spec = get_train_spec_wrapper
+def init_distributed_wrapper(self) -> ParallelDims:
+    global G_USING_TRAIN_CONFIG
+    G_USING_TRAIN_CONFIG = self.config
+    return _original_init_distributed(self)
+
+
+Trainer.init_distributed = init_distributed_wrapper

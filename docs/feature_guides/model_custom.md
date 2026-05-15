@@ -38,15 +38,15 @@ class NpuGroupedExperts(GroupedExperts):
 
     def __init__(
         self,
-        orig: GroupedExperts,
+        parent: GroupedExperts,
     ):
-        dim = orig.w2.shape[1]
-        hidden_dim = orig.w2.shape[2]
-        super().__init__(dim, hidden_dim, orig.num_experts, True)
+        dim = parent.w2.shape[1]
+        hidden_dim = parent.w2.shape[2]
+        super().__init__(dim, hidden_dim, parent.num_experts, True)
         if self.w1 is not None and self.w3 is not None:
             # pyrefly: ignore [no-matching-overload]
             w13_data = torch.empty(
-                orig.num_experts,
+                parent.num_experts,
                 hidden_dim * 2,
                 dim,
                 dtype=self.w1.dtype,
@@ -78,6 +78,7 @@ class NpuGroupedExperts(GroupedExperts):
 
 
 # 定义执行替换的Converter
+from torchtitan_npu.converters.convert_utils import replace_module_with_name
 from torchtitan_npu.converters.model_custom_converter import ModelCustomConverter
 
 class NpuGroupedExpertConverter(ModelCustomConverter):
@@ -85,18 +86,11 @@ class NpuGroupedExpertConverter(ModelCustomConverter):
         for name, module in model.named_modules():
             if not isinstance(module, GroupedExperts):
                 continue
-            splits = name.split(".")
-            # parent module name
-            parent_module_name = ".".join(splits[:-1])
-            module_name = splits[-1]
-            parent_module = model
-            if parent_module_name:
-                parent_module = model.get_submodule(parent_module_name)
-            setattr(parent_module, module_name, NpuGroupedExperts(module))
+            replace_module_with_name(model, name, NpuGroupedExperts(module))
 ```
 
 **要点：**
-- 应当实现参数是**原始实例**的构造函数，用于生成新子类的实例替换原实例
+- 应当构造数据域与**原始实例**相同的实例并按需扩展其他数据成员变量，用于替换原实例
 - 覆写定制化的业务逻辑的方法，比如`forward`、`init_weights` 等
 - 构造一个继承自ModelCustomConverter的自定义Converter，用于执行替换实例的动作
 

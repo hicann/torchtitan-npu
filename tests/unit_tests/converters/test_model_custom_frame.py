@@ -25,7 +25,7 @@ from torchtitan_npu.converters.model_custom_interface import (
     ParallelizePlanUpdater,
     StateDictUpdater,
 )
-from torchtitan_npu.converters.npu_registry import ConverterRegistry
+from torchtitan_npu.converters.npu_registry import registry
 
 
 class TestApplyParallelizePlanUpdater:
@@ -145,7 +145,7 @@ class TestApplyStateDictUpdateIntegration:
 class TestRegisterModelConverter:
     @classmethod
     def test_register_model_converter_adds_to_model_configs(cls):
-        test_registry = ConverterRegistry()
+        test_registry = registry()
         test_registry._model_configs = {}
 
         @test_registry.register("test_model_config")
@@ -158,7 +158,7 @@ class TestRegisterModelConverter:
 
     @classmethod
     def test_set_name(cls):
-        test_registry = ConverterRegistry()
+        test_registry = registry()
         test_registry._model_configs = {}
 
         @test_registry.register("custom_model_name")
@@ -169,7 +169,7 @@ class TestRegisterModelConverter:
 
     @classmethod
     def test_create_converter_class(cls):
-        test_registry = ConverterRegistry()
+        test_registry = registry()
         test_registry._model_configs = {}
 
         registered_converter_classes = []

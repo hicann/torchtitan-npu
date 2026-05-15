@@ -8,21 +8,18 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch.nn as nn
-
 from torch.distributed.tensor.parallel.style import ParallelStyle
 
-from torchtitan.distributed import ParallelDims
-from torchtitan.trainer import Trainer
+from torchtitan.protocols.model_spec import ModelSpec
 
 
 class ModelCustomConverter(ABC):
-    def __init__(self, trainer_config: Trainer.Config, parallel_dims: ParallelDims):
-        self.trainer_config = trainer_config
-        self.parallel_dims = parallel_dims
-        self.model_name = trainer_config.model_spec.name
+    def __init__(self, model_spec: ModelSpec):
+        self.model_spec = model_spec
+        self.model_name = self.model_spec.name
 
     @abstractmethod
-    def convert(self, model: nn.Module):
+    def convert(self, model: nn.Module) -> None:
         pass
 
 

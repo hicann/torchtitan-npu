@@ -13,6 +13,7 @@ from torchtitan.models.deepseek_v3 import (
     _EMBEDDING_INIT,
     _NORM_INIT,
     _output_linear_init,
+    DeepSeekV3StateDictAdapter,
 )
 from torchtitan.protocols.model_spec import ModelSpec
 
@@ -20,7 +21,6 @@ from torchtitan_npu.models.deepseek_v3.model import DeepSeekV3ModelNpu
 from torchtitan_npu.models.deepseek_v3.parallelize import parallelize_deepseekv3
 from torchtitan_npu.models.deepseek_v3.state_dict_adapter import (
     DeepSeek16BStateDictAdapterNpu,
-    DeepSeekV3StateDictAdapterNpu,
 )
 
 
@@ -184,7 +184,7 @@ def model_registry(flavor: str) -> ModelSpec:
     adapter_cls = (
         DeepSeek16BStateDictAdapterNpu
         if flavor == "16B"
-        else DeepSeekV3StateDictAdapterNpu
+        else DeepSeekV3StateDictAdapter
     )
     return ModelSpec(
         name="deepseek_v3",

@@ -171,3 +171,14 @@ def replace_methods(
     for m in matches:
         m.replace(new_method)
     return len(matches)
+
+
+def replace_module_with_name(model: nn.Module, name: str, new: nn.Module):
+    splits = name.split(".")
+    # parent module name
+    parent_module_name = ".".join(splits[:-1])
+    module_name = splits[-1]
+    parent_module = model
+    if parent_module_name:
+        parent_module = model.get_submodule(parent_module_name)
+    setattr(parent_module, module_name, new)
