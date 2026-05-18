@@ -50,7 +50,6 @@ from torchtitan_npu.models.deepseek_v4.model.model import (
     DSAIndexerLossLoggingHelper,
 )
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -181,14 +180,6 @@ def parallelize_deepseek_v4(
         ({parallel_dims.tp}) and 2 * CP degree ({parallel_dims.cp}).
         """
 
-    attn_type = getattr(model.model_args, "attn_type", "sdpa")
-    if job_config.parallelism.context_parallel_degree > 1 and attn_type != "sdpa":
-        raise NotImplementedError(
-            f"Context Parallel only supports SDPA attention. "
-            f"Got attn_type='{attn_type}'. "
-            f"FlexAttention and varlen attention are not supported with CP."
-        )
-
     # patch the indexer loss tracking with distributed version to get the synchronized indexer loss metric
     apply_distributed_indexer_loss_tracking(parallel_dims)
 
@@ -251,6 +242,26 @@ def parallelize_deepseek_v4(
             dual_pipe_v=dual_pipe_v,
             use_deepep=use_deepep,
         )
+
+    if job_config.parallelism.context_parallel_degree > 1:
+        if "deepseek_v4_sfa" not in job_config.model.converters:
+            raise ValueError(
+                "DeepSeek-V4 supports CP only when fused NPU kernel is enabled."
+            )
+
+        from torchtitan_npu.distributed.context_parallel.custom_context_parallel import (
+            _apply_dsv4_cp,
+            _is_dsv4_attention,
+        )
+
+        cp_mesh = parallel_dims.get_mesh("cp")
+        # pyrefly: ignore [not-callable]
+        for layer in model.layers.values():
+            # pyrefly: ignore [missing-attribute]
+            if _is_dsv4_attention(layer.attention, "dsv4"):
+                # pyrefly: ignore [bad-argument-type]
+                _apply_dsv4_cp(layer.attention, cp_mesh)
+        logger.info("Applied Context Parallel (DS-V4) to the model")
 
     model_compile_enabled = (
         job_config.compile.enable and "model" in job_config.compile.components
@@ -328,14 +339,6 @@ def apply_non_moe_tp(
 ):
     """Apply tensor parallelism."""
 
-    # whether the npu_dsa kernel is enabled
-    parallel_cfg = job_config.parallelism
-    use_cp = (
-        # pyrefly: ignore [missing-attribute]
-        parallel_cfg.enable_custom_context_parallel
-        and parallel_cfg.context_parallel_degree > 1
-    )
-    enable_npu_dsa = "npu_dsa" in job_config.model.converters or use_cp
     enable_activation_checkpoint = job_config.activation_checkpoint.mode in [
         "full",
         "selective",
@@ -620,10 +623,10 @@ def apply_non_moe_tp(
                 use_local_output=False,
             ),
             "attention.inner_attention.sparse_attn": attention_kernel_plan,
+            "attention.inner_attention.li_loss": li_loss_plan,
             "hc_post": hc_post_plan,
             "hc_pre": hc_pre_plan,
             "hc_pre.torch_hc_split_sinkhorn": hc_pre_sinkhon_plan,
-            "cal_index_loss.li_loss": li_loss_plan,
             "ffn_norm": SequenceParallel(),
         }
         # pyrefly: ignore [missing-attribute]
@@ -853,7 +856,7 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig, ep_enabled: b
                     transformer_block, attr_name
                 )
 
-                if attr_name in {"cal_index_loss", "hc_pre"}:
+                if attr_name in {"hc_pre"}:
                     continue
 
                 if isinstance(submod, moe_module.MoE):

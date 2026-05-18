@@ -23,6 +23,7 @@ from torchtitan.tools.logging import logger
 
 from .moe import MoEArgs
 
+
 # Reference: https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py
 @dataclass
 class DeepSeekV4ModelArgs(BaseModelArgs):
@@ -117,13 +118,6 @@ class DeepSeekV4ModelArgs(BaseModelArgs):
                 f"Sequence length {seq_len} exceeds original maximum {self.max_seq_len}."
             )
         self.max_seq_len = seq_len
-
-        if (
-            job_config.parallelism.context_parallel_degree > 1
-            # pyrefly: ignore [missing-attribute]
-            and self.attn_type != "sdpa"
-        ):
-            raise NotImplementedError("CP support is only supported for SDPA.")
 
         self.moe_args._debug_force_load_balance = (
             job_config.debug.moe_force_load_balance

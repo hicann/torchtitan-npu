@@ -22,6 +22,11 @@ logger = logging.getLogger(__name__)
 def reshape_for_broadcast(
     freqs_cis: torch.Tensor, x: torch.Tensor, positions: torch.Tensor | None = None
 ) -> torch.Tensor:
+    # Workaround for NPU's not supporting index operation for torch.complex64
+    def select_from_complex(freqs_cis: torch.Tensor, positions: torch.Tensor):
+        freqs_cis_real = torch.view_as_real(freqs_cis)
+        freqs_cis_real = freqs_cis_real[positions]
+        return torch.view_as_complex(freqs_cis_real)
 
     ndim = x.ndim
     assert ndim > 1
@@ -33,17 +38,13 @@ def reshape_for_broadcast(
         return freqs_cis.view(*shape)
     elif positions.size(0) == 1:
         assert positions.shape == (1, seqlen)
-        freqs_cis_real = torch.view_as_real(freqs_cis)
-        freqs_cis_real = freqs_cis_real[positions.squeeze(0)]
-        freqs_cis = torch.view_as_complex(freqs_cis_real)
+        freqs_cis = select_from_complex(freqs_cis, positions.squeeze(0))
         assert freqs_cis.shape == (seqlen, x.shape[-1] // 2)
         shape = [1, seqlen, 1, freqs_cis.shape[-1]]
         return freqs_cis.view(*shape)
     else:
         assert positions.shape == (x.shape[0], seqlen)
-        freqs_cis_real = torch.view_as_real(freqs_cis)
-        freqs_cis_real = freqs_cis_real[positions]
-        freqs_cis = torch.view_as_complex(freqs_cis_real)
+        freqs_cis = select_from_complex(freqs_cis, positions)
         shape = [x.shape[0], seqlen, 1, freqs_cis.shape[-1]]
         return freqs_cis.view(*shape)
 
@@ -96,20 +97,19 @@ def npu_apply_rotary_emb_deepseek(
 
 
 def npu_apply_rotary_emb_deepseek_v4(
-    x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    inverse: bool = False,
+    positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
     dtype = x.dtype
     x = x.float()
 
-    freqs_real = torch.view_as_real(freqs_cis)
-    cos = freqs_real[..., 0]  # (seq_len, head_dim/2)
-    sin = freqs_real[..., 1]  # (seq_len, head_dim/2)
+    freqs_cis = reshape_for_broadcast(freqs_cis, x, positions)
 
+    cos, sin = _prepare_cos_sin_from_complex(freqs_cis, x.dtype, already_broadcast=True)
     if inverse:
         sin = -sin
-
-    r1 = torch.stack([cos, cos], dim=-1).flatten(-2)  # (seq_len, head_dim)
-    r2 = torch.stack([sin, sin], dim=-1).flatten(-2)  # (seq_len, head_dim)
 
     input_3d = x.ndim == 3
     if input_3d:
@@ -120,11 +120,7 @@ def npu_apply_rotary_emb_deepseek_v4(
     else:
         raise ValueError(f"Input tensor must be 3D or 4D, got {x.ndim}D")
 
-    # (seq_len, head_dim) -> (1, seq_len, 1, head_dim)
-    r1 = r1.view(1, r1.size(0), 1, r1.size(1))
-    r2 = r2.view(1, r2.size(0), 1, r2.size(1))
-
-    y = torch_npu.npu_rotary_mul(x_4d, r1, r2, rotary_mode="interleave")
+    y = torch_npu.npu_rotary_mul(x_4d, cos, sin, rotary_mode="interleave")
 
     if input_3d:
         y = y.squeeze(2)

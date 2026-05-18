@@ -19,7 +19,6 @@ from torchtitan_npu.models.common.dsa_indexer_loss import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
 )
-
 from .args import DeepSeekV4ModelArgs
 from .moe import MoE
 
@@ -27,7 +26,10 @@ logger = logging.getLogger()
 
 
 def apply_rotary_emb(
-    x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    inverse: bool = False,
+    positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Applies rotary positional embeddings to the input tensor.
@@ -35,18 +37,32 @@ def apply_rotary_emb(
     Args:
         x (torch.Tensor): Input tensor with positional embeddings to be applied.
         freqs_cis (torch.Tensor): Precomputed complex exponential values for positional embeddings.
+        positions (torch.Tensor | None): Optional absolute position indices for selecting
+            the correct rows from ``freqs_cis``.  When ``None``, ``freqs_cis[0:seqlen]``
+            is used (standard non-CP case).
 
     Returns:
         torch.Tensor: Tensor with rotary embeddings applied.
     """
     original_dtype = x.dtype
     x_complex = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
+    seqlen = x_complex.size(1)
+    if positions is not None:
+        # CP: index into the full freqs_cis table by absolute positions.
+        # Use the real view to avoid complex64 indexing issues on NPU.
+        freqs_cis_real = torch.view_as_real(freqs_cis)
+        freqs_cis_real = freqs_cis_real[
+            positions.squeeze(0) if positions.size(0) == 1 else positions
+        ]
+        freqs_cis = torch.view_as_complex(freqs_cis_real)
+    else:
+        freqs_cis = freqs_cis[:seqlen]
     if inverse:
         freqs_cis = freqs_cis.conj()
     if x_complex.ndim == 3:
-        freqs_cis = freqs_cis.view(1, x_complex.size(1), x_complex.size(-1))
+        freqs_cis = freqs_cis.view(1, seqlen, x_complex.size(-1))
     else:
-        freqs_cis = freqs_cis.view(1, x_complex.size(1), 1, x_complex.size(-1))
+        freqs_cis = freqs_cis.view(1, seqlen, 1, x_complex.size(-1))
     x_rotated = torch.view_as_real(x_complex * freqs_cis).flatten(-2)
     return x_rotated.to(original_dtype)
 
@@ -150,21 +166,28 @@ class Compressor(nn.Module):
         new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]
         return new_tensor
 
-    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor):
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        positions: torch.Tensor | None = None,
+    ):
         _, seqlen, _ = x.size()
         ratio, overlap = self.compress_ratio, self.overlap
         dtype = x.dtype
-        if seqlen < ratio:
-            return
         x = x.float()
         kv = self.wkv(x)
         score = self.wgate(x)
-        remainder = seqlen % ratio
-        cutoff = seqlen - remainder
-        freqs_cis = freqs_cis[:cutoff:ratio]
-        if remainder > 0:
-            kv, _ = kv.split([cutoff, remainder], dim=1)
-            score = score[:, :cutoff]
+
+        if seqlen % ratio != 0:
+            raise ValueError(
+                f"seqlen ({seqlen}) must be divisible by compress_ratio ({ratio})"
+            )
+        if positions is not None:
+            comp_positions = positions[:, ::ratio]
+        else:
+            freqs_cis = freqs_cis[::ratio]
+            comp_positions = None
 
         kv = kv.unflatten(1, (-1, ratio))
         score = score.unflatten(1, (-1, ratio)) + self.ape
@@ -174,7 +197,9 @@ class Compressor(nn.Module):
 
         kv = (kv * score.softmax(dim=2)).sum(dim=2)
         kv = self.norm(kv.to(dtype))
-        kv_rot = apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs_cis)
+        kv_rot = apply_rotary_emb(
+            kv[..., -self.rope_head_dim :], freqs_cis, positions=comp_positions
+        )
         kv = torch.cat([kv[..., : -self.rope_head_dim], kv_rot], dim=-1)
         return kv
 
@@ -212,7 +237,7 @@ class Indexer(torch.nn.Module):
         qr: torch.Tensor,
         freqs_cis: torch.Tensor,
         hadamard_mat: torch.Tensor,
-        offset: int,
+        positions: torch.Tensor | None = None,
     ):
         bsz, seqlen, _ = x.size()
         rd = self.rope_head_dim
@@ -220,10 +245,10 @@ class Indexer(torch.nn.Module):
         q = q.view(bsz, seqlen, self.n_heads, self.head_dim)
         q = q.clone()
         q_nope, q_rope = torch.split(q, [self.head_dim - rd, rd], dim=-1)
-        q_rope = apply_rotary_emb(q_rope, freqs_cis)
+        q_rope = apply_rotary_emb(q_rope, freqs_cis, positions=positions)
         q = torch.cat([q_nope, q_rope], dim=-1)
         q = rotate_activation(q, hadamard_mat)
-        k = self.compressor(x, freqs_cis)
+        k = self.compressor(x, freqs_cis, positions=positions)
         k = rotate_activation(k, hadamard_mat)
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
         return q, k, weights
@@ -320,45 +345,6 @@ class LiLoss(torch.nn.Module):
         )
         self.save_loss(loss)
         return loss
-
-
-class ComputeIndexerLoss(nn.Module):
-    def __init__(
-        self,
-        n_heads: int,
-        softmax_scale: float,
-        compress_ratio: int,
-        layer_id: int,
-        n_layers: int,
-    ) -> None:
-        super().__init__()
-        self.li_loss = LiLoss(
-            n_heads, softmax_scale, compress_ratio, layer_id, n_layers
-        )
-
-    def forward(
-        self,
-        compress_topk_idxs,
-        offset,
-        q,
-        kv_compress,
-        attention_masks,
-        index_score,
-        q_indexer,
-        k_indexer,
-        weights,
-    ):
-        return self.li_loss(
-            q,
-            kv_compress,
-            q_indexer,
-            k_indexer,
-            weights,
-            compress_topk_idxs,
-            index_score,
-            attention_masks,
-            offset,
-        )
 
 
 class GetWindowTopkIdxs(torch.nn.Module):
@@ -563,7 +549,6 @@ class PreAttention(nn.Module):
             if layer_id < args.n_layers
             else args.mtp_layer_compress_ratio
         )
-        self.use_sfa = args.use_sfa
 
         self.wq_a = nn.Linear(args.dim, self.q_lora_rank, bias=False)
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
@@ -579,7 +564,11 @@ class PreAttention(nn.Module):
             self.compressor_128 = Compressor(args, self.compress_ratio, self.head_dim)
 
     def forward(
-        self, x: torch.Tensor, freqs_cis: torch.Tensor, hadamard_mat: torch.Tensor
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        hadamard_mat: torch.Tensor,
+        positions: torch.Tensor | None = None,
     ):
         rd = self.rope_head_dim
         # Q projection
@@ -587,29 +576,32 @@ class PreAttention(nn.Module):
         q = self.wq_b(q).unflatten(-1, (self.n_heads, self.head_dim))
         q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
         q_nope, q_rope = torch.split(q, [self.head_dim - rd, rd], dim=-1)
-        q_rope = apply_rotary_emb(q_rope, freqs_cis)
+        q_rope = apply_rotary_emb(q_rope, freqs_cis, positions=positions)
         q = torch.cat([q_nope, q_rope], dim=-1)
 
-        kv = kv_compress = q_indexer = k_indexer = weights = offset = None
+        kv = kv_compress = q_indexer = k_indexer = weights = None
 
         kv = self.wkv(x)
         kv = self.kv_norm(kv)
         kv_nope, kv_rope = torch.split(kv, [self.head_dim - rd, rd], dim=-1)
-        kv_rope = apply_rotary_emb(kv_rope, freqs_cis)
+        kv_rope = apply_rotary_emb(kv_rope, freqs_cis, positions=positions)
         kv = torch.cat([kv_nope, kv_rope], dim=-1)
-        offset = 0 if self.use_sfa else kv.size(1)
 
         if self.compress_ratio > 1 and hasattr(self, "indexer"):
             q_indexer, k_indexer, weights = self.indexer(
-                x.detach(), qr.detach(), freqs_cis, hadamard_mat, offset
+                x.detach(),
+                qr.detach(),
+                freqs_cis,
+                hadamard_mat,
+                positions=positions,
             )
 
         if self.compress_ratio == 4:
-            kv_compress = self.compressor(x, freqs_cis)
+            kv_compress = self.compressor(x, freqs_cis, positions=positions)
         elif self.compress_ratio > 1:
-            kv_compress = self.compressor_128(x, freqs_cis)
+            kv_compress = self.compressor_128(x, freqs_cis, positions=positions)
 
-        return q, kv, kv_compress, q_indexer, k_indexer, weights, offset
+        return q, kv, kv_compress, q_indexer, k_indexer, weights
 
     def init_weights(self, init_std: float):
         linear_list = [self.wq_a, self.wq_b]
@@ -637,34 +629,60 @@ class InnerAttention(nn.Module):
             if layer_id < args.n_layers
             else args.mtp_layer_compress_ratio
         )
+        self.use_sfa = args.use_sfa
+
         self.attn_sink = nn.Parameter(torch.empty(args.n_heads, dtype=torch.float32))
         self.sparse_attn = SparseAttention(layer_id, args)
         if self.compress_ratio == 4:
             self.li_compute = LiCompute(self.compress_ratio, args.index_topk)
+            self.li_loss = LiLoss(
+                args.n_heads,
+                args.head_dim**-0.5,
+                self.compress_ratio,
+                layer_id,
+                args.n_layers,
+            )
 
     def forward(
         self,
         q: torch.Tensor,
-        kv: torch.Tensor | None,
+        kv: torch.Tensor,
         kv_compress: torch.Tensor | None,
         q_indexer: torch.Tensor | None,
         k_indexer: torch.Tensor | None,
         weights: torch.Tensor | None,
         seqlen: int,
-        offset: int | None,
+        attention_masks=None,
     ):
+        offset = 0 if self.use_sfa else kv.size(1)
         compress_topk_idxs = index_score = None
-        if (
+        has_li = (
             self.compress_ratio > 1
             and hasattr(self, "li_compute")
             and q_indexer is not None
-        ):
+        )
+        if has_li:
             compress_topk_idxs, index_score = self.li_compute(
                 q_indexer, k_indexer, weights, seqlen, offset
             )
 
         # We performed QAT here, kv could also use fp8 format, though current implementation uses bf16
         o = self.sparse_attn(q, kv, self.attn_sink, kv_compress, compress_topk_idxs)
+
+        if has_li:
+            loss = self.li_loss(
+                q,
+                kv_compress,
+                q_indexer,
+                k_indexer,
+                weights,
+                compress_topk_idxs,
+                index_score,
+                attention_masks,
+                offset,
+            )
+            o = DSAIndexerLossAutoScaler.apply(o, loss)
+
         return o, compress_topk_idxs, index_score
 
 
@@ -692,10 +710,11 @@ class PostAttention(nn.Module):
         bsz: int,
         seqlen: int,
         n_local_groups: int,
+        positions: torch.Tensor | None = None,
     ):
         rd = self.rope_head_dim
         o_nope, o_rope = torch.split(o, [self.head_dim - rd, rd], dim=-1)
-        o_rope = apply_rotary_emb(o_rope, freqs_cis, True)
+        o_rope = apply_rotary_emb(o_rope, freqs_cis, True, positions=positions)
         o = torch.cat([o_nope, o_rope], dim=-1)
         o = o.view(bsz, seqlen, n_local_groups, -1)
         wo_a = self.wo_a.weight.view(n_local_groups, self.o_lora_rank, -1)
@@ -735,34 +754,35 @@ class Attention(nn.Module):
         freqs_cis: torch.Tensor,
         hadamard_mat: torch.Tensor,
         attention_masks: AttentionMasksType | None,
+        positions: torch.Tensor | None = None,
     ):
         bsz, seqlen, _ = x.size()
-        freqs_cis = freqs_cis[:seqlen].to(x.device)
+        freqs_cis = freqs_cis.to(x.device)
 
-        q, kv, kv_compress, q_indexer, k_indexer, weights, offset = self.pre_attention(
-            x, freqs_cis, hadamard_mat
+        q, kv, kv_compress, q_indexer, k_indexer, weights = self.pre_attention(
+            x,
+            freqs_cis,
+            hadamard_mat,
+            positions=positions,
         )
 
         n_local_groups = self.n_groups // (self.n_heads // q.shape[2])
 
         o, compress_topk_idxs, index_score = self.inner_attention(
-            q, kv, kv_compress, q_indexer, k_indexer, weights, seqlen, offset
-        )
-
-        x = self.post_attention(o, freqs_cis, bsz, seqlen, n_local_groups)
-
-        return (
-            x,
-            compress_topk_idxs,
-            offset,
             q,
+            kv,
             kv_compress,
-            attention_masks,
-            index_score,
             q_indexer,
             k_indexer,
             weights,
+            seqlen,
+            attention_masks,
         )
+
+        x = self.post_attention(
+            o, freqs_cis, bsz, seqlen, n_local_groups, positions=positions
+        )
+        return x
 
     def init_weights(self, init_std: float, buffer_device):
         self.pre_attention.init_weights(init_std)
@@ -898,13 +918,6 @@ class DeepSeekV4TransformerBlock(nn.Module):
             if layer_id < model_args.n_layers
             else model_args.mtp_layer_compress_ratio
         )
-        self.cal_index_loss = ComputeIndexerLoss(
-            model_args.n_heads,
-            model_args.head_dim**-0.5,
-            self.compress_ratio,
-            layer_id,
-            model_args.n_layers,
-        )
 
     def forward(
         self,
@@ -913,11 +926,13 @@ class DeepSeekV4TransformerBlock(nn.Module):
         freqs_cis: torch.Tensor,
         hadamard_mat: torch.Tensor,
         attention_masks: AttentionMasksType | None,
+        positions: torch.Tensor | None = None,
     ):
         """
         Forward pass for the Transformer block.
 
         Args:
+
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, hc_mult, dim).
             input_ids (torch.Tensor): Input tensor of token IDs with shape (batch_size, seq_len).
 
@@ -929,33 +944,9 @@ class DeepSeekV4TransformerBlock(nn.Module):
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
         x = self.attention_norm(x)
-        (
-            x,
-            compress_topk_idxs,
-            offset,
-            q,
-            kv_compress,
-            attention_masks,
-            index_score,
-            q_indexer,
-            k_indexer,
-            weights,
-        ) = self.attention(x, freqs_cis, hadamard_mat, attention_masks)
-        if self.attention.compress_ratio > 1 and hasattr(
-            self.attention.pre_attention, "indexer"
-        ):
-            loss = self.cal_index_loss(
-                compress_topk_idxs,
-                offset,
-                q,
-                kv_compress,
-                attention_masks,
-                index_score,
-                q_indexer,
-                k_indexer,
-                weights,
-            )
-            x = DSAIndexerLossAutoScaler.apply(x, loss)
+        x = self.attention(
+            x, freqs_cis, hadamard_mat, attention_masks, positions=positions
+        )
 
         x = self.hc_post(x, residual, post, comb)
         residual = x
@@ -1031,6 +1022,7 @@ class MTPModule(DeepSeekV4TransformerBlock):
         freqs_cis: torch.Tensor,
         hadamard_mat: torch.Tensor,
         attention_masks: AttentionMasksType | None,
+        positions: torch.Tensor | None = None,
     ):
         """
         Forward pass for the Transformer block.
@@ -1051,33 +1043,9 @@ class MTPModule(DeepSeekV4TransformerBlock):
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
         x = self.attention_norm(x)
-        (
-            x,
-            compress_topk_idxs,
-            offset,
-            q,
-            kv_compress,
-            attention_masks,
-            index_score,
-            q_indexer,
-            k_indexer,
-            weights,
-        ) = self.attention(x, freqs_cis, hadamard_mat, attention_masks)
-        if self.attention.compress_ratio > 1 and hasattr(
-            self.attention.pre_attention, "indexer"
-        ):
-            loss = self.cal_index_loss(
-                compress_topk_idxs,
-                offset,
-                q,
-                kv_compress,
-                attention_masks,
-                index_score,
-                q_indexer,
-                k_indexer,
-                weights,
-            )
-            x = DSAIndexerLossAutoScaler.apply(x, loss)
+        x = self.attention(
+            x, freqs_cis, hadamard_mat, attention_masks, positions=positions
+        )
 
         x = self.hc_post(x, residual, post, comb)
         residual = x
@@ -1152,6 +1120,7 @@ class DeepSeekV4Model(ModelProtocol):
         tokens: torch.Tensor,
         input_ids: torch.Tensor | None = None,
         attention_masks: AttentionMasksType | None = None,
+        positions: torch.Tensor | None = None,
     ):
         """
         Forward pass for the Transformer model.
@@ -1179,12 +1148,15 @@ class DeepSeekV4Model(ModelProtocol):
                 h = layer(
                     h,
                     input_ids,
-                    self.freqs_cis
-                    # pyrefly: ignore [bad-index]
-                    if self.model_args.compress_ratios[layer.layer_id] > 1
-                    else self.freqs_cis_wo_compressor,
+                    (
+                        self.freqs_cis
+                        # pyrefly: ignore [bad-index]
+                        if self.model_args.compress_ratios[layer.layer_id] > 1
+                        else self.freqs_cis_wo_compressor
+                    ),
                     self.hadamard_mat,
                     attention_masks,
+                    positions=positions,
                 )
             else:
                 break
@@ -1218,6 +1190,7 @@ class DeepSeekV4Model(ModelProtocol):
                     self.freqs_cis_wo_compressor,
                     self.hadamard_mat,
                     attention_masks,
+                    positions=positions,
                 )
                 h = (
                     self.hc_head(

@@ -47,7 +47,7 @@ version = {file = "assets/version.txt"}
 
 [tool.codespell]
 skip = ["*.json"]
-ignore-words-list = ["cann", "nD"]
+ignore-words-list = ["cann", "nD", "dOut"]
 
 # ---- Explicit project build information ---- #
 [build-system]
