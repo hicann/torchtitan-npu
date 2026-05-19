@@ -300,7 +300,7 @@ class SwapOptimizersContainer(OptimizersContainer):
     @classmethod
     def _tensor_for_state_dict(cls, tensor, like_param=None):
         local_tensor = unwrap_dtensor(tensor)
-        if local_tensor.untyped_storage().size() == 0:
+        if local_tensor.numel() != 0 and local_tensor.untyped_storage().size() == 0:
             raise RuntimeError(
                 "Cannot checkpoint a swapped optimizer state without CPU cache."
             )

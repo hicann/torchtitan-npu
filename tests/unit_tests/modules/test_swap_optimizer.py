@@ -266,6 +266,27 @@ def test_state_dict_preserves_dtensor_layout_for_cpu_cache(monkeypatch):
     )
 
 
+def test_state_dict_allows_zero_numel_cpu_cache_shard():
+    empty_shard = torch.empty(0, 16384, device="cpu")
+
+    value = swap_optimizer.SwapOptimizersContainer._tensor_for_state_dict(empty_shard)
+
+    assert value.shape == torch.Size([0, 16384])
+    assert value.numel() == 0
+    assert value.untyped_storage().size() == 0
+
+
+def test_state_dict_rejects_nonempty_cache_placeholder_without_storage():
+    placeholder = torch.empty(4, 16384, device="cpu")
+    placeholder.untyped_storage().resize_(0)
+
+    try:
+        swap_optimizer.SwapOptimizersContainer._tensor_for_state_dict(placeholder)
+        raise AssertionError("Expected zero-storage nonempty tensor to be rejected")
+    except RuntimeError as exc:
+        assert "without CPU cache" in str(exc)
+
+
 def test_load_state_dict_rebuilds_swap_state_without_mutating_checkpoint(monkeypatch):
     source = _build_swapped_optimizer(
         monkeypatch,
