@@ -52,7 +52,12 @@ def _apply_patches():
 
     # async_tp
     # patching torch
-    from .patches.torch import clip_grad, micro_pipeline_tp, pipelining  # noqa: F401
+    from .patches.torch import (  # noqa: F401
+        checkpoint,
+        clip_grad,
+        micro_pipeline_tp,
+        pipelining,
+    )
 
     # patching fake process group
     from .patches.torch.testing._internal.distributed import fake_pg  # noqa: F401

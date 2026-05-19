@@ -32,9 +32,9 @@
 
 | 配置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `name` | str | "AdamW" | 使用的优化器类型。当前 Swap 特性拦截并支持 `Adam` 和 `AdamW`。 |
-| `swap_optimizer` | bool | false | 是否启用 Swap Optimizer 特性以进行显存流水线卸载。 |
-| `swap_optimizer_times` | int | 16 | 切片划分次数。用于决定优化器参数卸载与加载时的分块大小。值越大，单次峰值显存占用越小，但可能增加系统的流调度开销。 |
+| `name` | str | `"AdamW"` | 使用的优化器类型。当前 Swap Optimizer 仅拦截并支持 `Adam` 和 `AdamW`。 |
+| `swap_optimizer` | bool | `false` | 是否启用 Swap Optimizer 特性以进行显存流水线卸载。 |
+| `swap_optimizer_times` | int | `16` | 切片划分次数。用于决定优化器参数卸载与加载时的分块大小。值越大，单次峰值显存占用越小，但可能增加系统的流调度开销。 |
 
 ### 配置示例
 首先在配置文件中使能本代码仓的自定义配置，随后在 `[optimizer]` 节中添加以下配置，为AdamW优化器开启SwapOptimizer特性并设置流水线切片参数：
@@ -50,3 +50,58 @@ weight_decay = 0.01
 swap_optimizer = true       # 启用 Swap Optimizer
 swap_optimizer_times = 16   # 设置流水切分次数
 ```
+
+## Swap Optimizer 与 Checkpoint
+
+Swap Optimizer 已支持与 TorchTitan checkpoint 组合使用，包括同步保存、`async` 异步保存和 `async_with_pinned_mem` 异步保存。保存 checkpoint 时，`SwapOptimizersContainer.state_dict()` 会先等待正在进行的 swap/offload 操作完成，再保存 CPU 侧真实的 optimizer state，而不是保存 device 侧的零显存占位 Tensor。恢复 checkpoint 时，`load_state_dict()` 会把 checkpoint 中的 optimizer state 重新加载到 CPU 缓存，并重建 device 侧零显存占位状态，以继续后续训练。
+
+### Checkpoint 相关配置
+
+使用下列 checkpoint 配置前，同样需要先通过 `[job] custom_config_module = "torchtitan_npu.config.custom_config"` 使能本代码仓的自定义配置。
+
+| 配置项 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `checkpoint.sync_files` | bool | `true` | 是否在 checkpoint 写文件后执行文件同步。设置为 `false` 可以减少保存耗时，但异常掉电等场景下落盘可靠性更弱。 |
+| `checkpoint.drop_page_cache_after_save` | bool | `false` | 保存后是否尝试释放 checkpoint 文件占用的 page cache。该选项只影响主机缓存，不会删除 checkpoint 文件。 |
+| `checkpoint.empty_cache_after_save` | bool | `true` | 保存后是否执行 NPU allocator cache 清理，用于降低保存后的显存缓存占用。 |
+| `checkpoint.async_mode` | str | `"disabled"` | Checkpoint 保存模式，支持 `disabled`、`async`、`async_with_pinned_mem`。 |
+
+### Swap Optimizer + Checkpoint 配置示例
+
+```toml
+[job]
+custom_config_module = "torchtitan_npu.config.custom_config"
+
+[optimizer]
+name = "AdamW"
+lr = 3e-4
+weight_decay = 0.01
+swap_optimizer = true
+swap_optimizer_times = 16
+
+[checkpoint]
+enable = true
+folder = "checkpoint"
+async_mode = "disabled"
+sync_files = false
+drop_page_cache_after_save = false
+empty_cache_after_save = true
+```
+
+当需要验证 `async_with_pinned_mem` 异步保存时，可以将 checkpoint 配置调整为：
+
+```toml
+[checkpoint]
+enable = true
+folder = "checkpoint_async_with_pinned_mem"
+async_mode = "async_with_pinned_mem"
+sync_files = false
+drop_page_cache_after_save = false
+empty_cache_after_save = true
+```
+
+使用时需要注意：
+1. `swap_optimizer` 目前不支持 `Muon` 优化器；如需节省 `Muon` 场景下的优化器显存，可使用 Virtual Optimizer 相关能力。
+2. `sync_files = false` 只影响 checkpoint 文件同步策略，不影响 checkpoint 内容和训练精度。
+3. `drop_page_cache_after_save` 和 `empty_cache_after_save` 只影响保存后的缓存释放，不会改变 checkpoint 内容。
+4. `async_with_pinned_mem` 和 `async` 会带来更高的峰值内存，请根据训练的内存状况适当开启

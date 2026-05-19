@@ -111,8 +111,30 @@ def _cp_tests() -> List[OverrideDefinitions]:
     ]
 
 
+def _checkpoint_tests() -> List[OverrideDefinitions]:
+    return [
+        OverrideDefinitions(
+            [
+                [
+                    "--model.name deepseek_v32",
+                    "--model.flavor tinymodel",
+                    "--training.steps 2",
+                    "--checkpoint.enable",
+                    "--checkpoint.interval 1",
+                    "--checkpoint.folder checkpoint_async_with_pinned_mem",
+                    "--checkpoint.async-mode async_with_pinned_mem",
+                    "--checkpoint.no-sync-files",
+                ]
+            ],
+            "DeepSeek V32 checkpoint async_with_pinned_mem",
+            "deepseek_v32_checkpoint_async_with_pinned_mem",
+            ngpu=2,
+        ),
+    ]
+
+
 def generate_smoke_tests() -> List[OverrideDefinitions]:
-    return _base_tests() + _cp_tests()
+    return _base_tests() + _cp_tests() + _checkpoint_tests()
 
 
 def main():

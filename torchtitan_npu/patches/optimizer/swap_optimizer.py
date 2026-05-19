@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 import torchtitan
 import torchtitan.components.optimizer
+from torch.distributed.checkpoint.state_dict import _get_fqns
 from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 from torch.optim.optimizer import _use_grad_for_differentiable
@@ -51,6 +52,19 @@ def unwrap_dtensor(tensor):
     return tensor
 
 
+def wrap_like_param(local_tensor: torch.Tensor, tensor):
+    if isinstance(tensor, DTensor):
+        return DTensor.from_local(
+            local_tensor,
+            device_mesh=tensor.device_mesh,
+            placements=tensor.placements,
+            shape=tensor.size(),
+            stride=tensor.stride(),
+            run_check=False,
+        )
+    return local_tensor
+
+
 class SwapOptimizersContainer(OptimizersContainer):
     """A container for optimizers which can be swapped between host and device to save memory during training.
 
@@ -71,6 +85,7 @@ class SwapOptimizersContainer(OptimizersContainer):
     param_update_events_map = {}
 
     state_keys = ["exp_avg", "exp_avg_sq", "max_exp_avg_sq"]
+    _MISSING = object()
 
     def __init__(
         self,
@@ -104,6 +119,92 @@ class SwapOptimizersContainer(OptimizersContainer):
                 f"Swap param numel for optimizer_{idx}: {optim.swap_numel} / {swap_num}\n"
             )
 
+    @staticmethod
+    def _restore_states(original_states):
+        for state, original_state in original_states:
+            state.clear()
+            state.update(original_state)
+
+    @staticmethod
+    def _empty_device_cache():
+        try:
+            get_torch_device().empty_cache()
+        except Exception as exc:
+            logger.debug("Failed to empty device cache after optimizer load: %s", exc)
+
+    @staticmethod
+    def _move_step_to_device(step):
+        if torch.is_tensor(step) and step.device.type == "cpu":
+            return step.to(get_torch_device().current_device())
+        return step
+
+    @staticmethod
+    def _save_optimizer_states():
+        original_states = []
+        for cpu_state in SwapOptimizersContainer.param_to_cpu_states_map.values():
+            original_states.append((cpu_state, dict(cpu_state)))
+        for state in SwapOptimizersContainer.param_to_device_states_map.values():
+            original_states.append((state, dict(state)))
+        return original_states
+
+    @staticmethod
+    def _save_param_groups(optimizers):
+        return [
+            (group, dict(group)) for optim in optimizers for group in optim.param_groups
+        ]
+
+    @staticmethod
+    def _restore_param_groups(original_param_groups):
+        for group, original_group in original_param_groups:
+            group.clear()
+            group.update(original_group)
+
+    @staticmethod
+    def _param_group_value_for_state_dict(value):
+        if torch.is_tensor(value):
+            return unwrap_dtensor(value).detach().cpu().clone()
+        return value
+
+    @staticmethod
+    def _param_names_by_param(model_part):
+        param_names_by_param: dict[Any, list[str]] = {}
+        try:
+            named_parameters = model_part.named_parameters(remove_duplicate=False)
+        except TypeError:
+            named_parameters = model_part.named_parameters()
+        for name, param in named_parameters:
+            param_names = param_names_by_param.get(param)
+            if param_names is None:
+                param_names = []
+                param_names_by_param[param] = param_names
+            param_names.append(name)
+        return param_names_by_param
+
+    @staticmethod
+    def _fqns_by_param(model_part):
+        fqns_by_param = {}
+        param_names_by_param = SwapOptimizersContainer._param_names_by_param(model_part)
+        for name, param in model_part.named_parameters():
+            ordered_fqns = []
+            for param_name in param_names_by_param.get(param, [name]):
+                fqns = set(_get_fqns(model_part, param_name))
+                if not fqns:
+                    raise AssertionError(
+                        f"Expected at least 1 FQN for parameter '{param_name}', got 0"
+                    )
+                if len(fqns) > 1 and param_name not in fqns:
+                    raise NotImplementedError(
+                        "Swap optimizer checkpoint does not support saving "
+                        f"flattened parameter '{param_name}' that maps to multiple "
+                        f"FQNs: {sorted(fqns)}"
+                    )
+                ordered_fqns.extend(
+                    fqn for fqn in [param_name, *sorted(fqns)] if fqn in fqns
+                )
+            ordered_fqns = list(dict.fromkeys(ordered_fqns))
+            fqns_by_param[param] = tuple(ordered_fqns)
+        return fqns_by_param
+
     @classmethod
     def param_state_initialization(cls, param, optim):
         cls.swap_to_host_events_map[param] = None
@@ -122,14 +223,13 @@ class SwapOptimizersContainer(OptimizersContainer):
                 device_state[key] = None
                 cpu_state[key] = None
             else:
-                device_state[key] = torch.zeros_like(
-                    param, memory_format=torch.contiguous_format
-                )
-                unwrap_dtensor(device_state[key]).untyped_storage().resize_(
-                    0
-                )  # offload device states
+                local_param = unwrap_dtensor(param)
                 cpu_state[key] = torch.zeros_like(
-                    unwrap_dtensor(param), pin_memory=True, device="cpu"
+                    local_param, pin_memory=True, device="cpu"
+                )
+                device_state[key] = cls._clone_loaded_state_for_device_placeholder(
+                    param,
+                    cpu_state[key],
                 )
 
     @classmethod
@@ -139,14 +239,25 @@ class SwapOptimizersContainer(OptimizersContainer):
 
         cpu_state = cls.param_to_cpu_states_map[param]
         device_state = cls.param_to_device_states_map[param]
+        local_param = unwrap_dtensor(param)
         for key in cls.state_keys:
             if key not in cpu_state or cpu_state[key] is None:
                 continue
             local_state = unwrap_dtensor(device_state[key])
             if local_state.untyped_storage().size() == 0:
-                local_state.untyped_storage().resize_(
-                    cpu_state[key].untyped_storage().size()
-                )
+                if local_state.device != local_param.device:
+                    local_state = torch.empty_strided(
+                        cpu_state[key].size(),
+                        cpu_state[key].stride(),
+                        dtype=cpu_state[key].dtype,
+                        layout=cpu_state[key].layout,
+                        device=local_param.device,
+                    )
+                    device_state[key] = wrap_like_param(local_state, param)
+                else:
+                    local_state.untyped_storage().resize_(
+                        cpu_state[key].untyped_storage().size()
+                    )
                 local_state.copy_(cpu_state[key], non_blocking=True)
 
         cls.swap_to_device_events_map[param] = (
@@ -185,6 +296,210 @@ class SwapOptimizersContainer(OptimizersContainer):
         if event is not None:
             get_torch_device().current_stream().wait_event(event)
             cls.param_update_events_map[param] = None
+
+    @classmethod
+    def _tensor_for_state_dict(cls, tensor, like_param=None):
+        local_tensor = unwrap_dtensor(tensor)
+        if local_tensor.untyped_storage().size() == 0:
+            raise RuntimeError(
+                "Cannot checkpoint a swapped optimizer state without CPU cache."
+            )
+        if local_tensor.device.type == "cpu":
+            cpu_tensor = local_tensor.detach()
+        else:
+            cpu_tensor = local_tensor.detach().cpu()
+        if isinstance(like_param, DTensor):
+            return wrap_like_param(cpu_tensor, like_param)
+        return cpu_tensor
+
+    @classmethod
+    def _state_value_for_state_dict(cls, param, state, key):
+        cpu_state = cls.param_to_cpu_states_map.get(param)
+        if cpu_state is not None:
+            cpu_value = cpu_state.get(key)
+            if cpu_value is not None:
+                return cls._tensor_for_state_dict(cpu_value, param)
+
+        value = state.get(key)
+        if value is None:
+            return None
+        return cls._tensor_for_state_dict(value, param)
+
+    @classmethod
+    def _state_step_for_state_dict(cls, optim, param, state):
+        if "step" in state:
+            step = state["step"]
+            if torch.is_tensor(step):
+                return step.detach().cpu().clone()
+            return step
+
+        group = getattr(optim, "param_to_group_map", {}).get(param)
+        if group is not None and "step" in group:
+            step = group["step"]
+            if torch.is_tensor(step):
+                return step.detach().cpu().clone()
+            return step
+        if any(state.get(key) is not None for key in cls.state_keys):
+            return torch.tensor(0, dtype=torch.int64, device="cpu")
+        return None
+
+    @classmethod
+    def _add_param_group_to_state_dict(cls, state_dict, group, fqn):
+        for key, value in group.items():
+            if key == "params":
+                continue
+            state_dict[
+                f"param_groups.{fqn}.{key}"
+            ] = cls._param_group_value_for_state_dict(value)
+
+    @classmethod
+    def _add_param_state_to_state_dict(cls, state_dict, optim, param, fqn):
+        state = optim.state[param]
+        for key in cls.state_keys:
+            value = cls._state_value_for_state_dict(param, state, key)
+            if value is not None:
+                state_dict[f"state.{fqn}.{key}"] = value
+
+        step = cls._state_step_for_state_dict(optim, param, state)
+        if step is not None:
+            state_dict[f"state.{fqn}.step"] = step
+
+    @classmethod
+    def _optimizer_state_dict(cls, model_part, optim):
+        fqns_by_param = cls._fqns_by_param(model_part)
+        state_dict = {}
+        for group in optim.param_groups:
+            for param in group["params"]:
+                fqn = fqns_by_param[param][0]
+                cls._add_param_state_to_state_dict(state_dict, optim, param, fqn)
+                cls._add_param_group_to_state_dict(state_dict, group, fqn)
+        return state_dict
+
+    @classmethod
+    def _wait_pending_swap_to_host(cls):
+        if cls.swap_to_host_stream is None:
+            return
+        get_torch_device().current_stream().wait_stream(cls.swap_to_host_stream)
+
+    @classmethod
+    def _clone_to_cpu_cache(cls, tensor):
+        cpu_tensor = unwrap_dtensor(tensor).detach().cpu()
+        try:
+            cached_tensor = torch.empty_like(
+                cpu_tensor,
+                pin_memory=True,
+                device="cpu",
+            )
+            cached_tensor.copy_(cpu_tensor, non_blocking=True)
+            return cached_tensor
+        except RuntimeError:
+            return cpu_tensor.clone()
+
+    @classmethod
+    def _clone_loaded_state_for_device_placeholder(cls, param, tensor):
+        local_tensor = unwrap_dtensor(tensor)
+        local_param = unwrap_dtensor(param)
+        placeholder = torch.empty_strided(
+            local_tensor.size(),
+            local_tensor.stride(),
+            dtype=local_tensor.dtype,
+            layout=local_tensor.layout,
+            device=local_tensor.device,
+        )
+        placeholder.untyped_storage().resize_(0)
+        if placeholder.device != local_param.device:
+            return placeholder
+        return wrap_like_param(placeholder, param)
+
+    @classmethod
+    def _clone_loaded_value(cls, value):
+        if torch.is_tensor(value):
+            return unwrap_dtensor(value).detach().clone()
+        return value
+
+    @classmethod
+    def _state_dict_value_for_fqns(cls, state_dict, prefix, fqns, key):
+        for fqn in fqns:
+            flat_key = f"{prefix}.{fqn}.{key}"
+            if flat_key in state_dict:
+                return state_dict[flat_key]
+        return cls._MISSING
+
+    @classmethod
+    def _load_param_group(cls, group, fqns, state_dict):
+        for key in group:
+            if key == "params":
+                continue
+            value = cls._state_dict_value_for_fqns(
+                state_dict, "param_groups", fqns, key
+            )
+            if value is not cls._MISSING:
+                group[key] = cls._clone_loaded_value(value)
+
+    @classmethod
+    def _load_param_state(cls, optim, param, fqns, state_dict):
+        group = optim.param_to_group_map[param]
+        state = optim.state[param]
+        state.clear()
+        cpu_state = cls.param_to_cpu_states_map.setdefault(param, {})
+        cls.param_to_device_states_map[param] = state
+
+        for key in cls.state_keys:
+            value = cls._state_dict_value_for_fqns(state_dict, "state", fqns, key)
+            if value is not cls._MISSING:
+                cpu_state[key] = cls._clone_to_cpu_cache(value)
+                state[key] = cls._clone_loaded_state_for_device_placeholder(
+                    param,
+                    cpu_state[key],
+                )
+                unwrap_dtensor(state[key]).untyped_storage().resize_(0)
+            elif key == "max_exp_avg_sq" and not group["amsgrad"]:
+                state[key] = None
+                cpu_state[key] = None
+            else:
+                cpu_state.pop(key, None)
+
+        step = cls._state_dict_value_for_fqns(state_dict, "state", fqns, "step")
+        if step is cls._MISSING:
+            step = cls._state_dict_value_for_fqns(
+                state_dict, "param_groups", fqns, "step"
+            )
+        if step is not cls._MISSING:
+            group["step"] = cls._clone_loaded_value(step)
+
+    @classmethod
+    def _load_optimizer_state_dict(cls, model_part, optim, state_dict):
+        fqns_by_param = cls._fqns_by_param(model_part)
+        optim.param_to_group_map = {}
+
+        for group in optim.param_groups:
+            loaded_group = False
+            for param in group["params"]:
+                optim.param_to_group_map[param] = group
+                fqns = fqns_by_param[param]
+                if not loaded_group:
+                    cls._load_param_group(group, fqns, state_dict)
+                    loaded_group = True
+                cls._load_param_state(optim, param, fqns, state_dict)
+
+    def state_dict(self) -> dict[str, Any]:
+        self._wait_pending_swap_to_host()
+        state_dict = {}
+        for model_part, optim in zip(self.model_parts, self.optimizers):
+            state_dict.update(self._optimizer_state_dict(model_part, optim))
+        return state_dict
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        original_states = self._save_optimizer_states()
+        original_param_groups = self._save_param_groups(self.optimizers)
+        try:
+            for model_part, optim in zip(self.model_parts, self.optimizers):
+                self._load_optimizer_state_dict(model_part, optim, state_dict)
+        except Exception:
+            self._restore_states(original_states)
+            self._restore_param_groups(original_param_groups)
+            raise
+        self._empty_device_cache()
 
 
 def param_update(param, state, param_group):
@@ -255,8 +570,7 @@ def swap_optimizer_step(self, closure=None):
     for group in self.param_groups:
         if "step" in group:
             group["step"] += 1
-            if group["step"].is_cpu:
-                group["step"] = group["step"].cuda()
+            group["step"] = SwapOptimizersContainer._move_step_to_device(group["step"])
         else:
             group["step"] = torch.tensor(
                 1,

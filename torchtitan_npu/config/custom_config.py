@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from torchtitan.config.job_config import (
+    Checkpoint as BaseCheckpoint,
     JobConfig as BaseJobConfig,
     Optimizer as BaseOptimizer,
     Parallelism as BaseParallelism,
@@ -158,6 +159,28 @@ class Profiling(BaseProfiling):
 
 
 @dataclass
+class Checkpoint(BaseCheckpoint):
+    """
+    Whether FileSystemWriter fsyncs checkpoint files before returning.
+    Disabling this can reduce checkpoint latency but weakens crash consistency.
+    """
+
+    sync_files: bool = True
+
+    """
+    Whether to ask Linux to drop checkpoint file pages from host page cache after writing.
+    This reduces host memory pressure for large checkpoints without changing checkpoint files.
+    """
+    drop_page_cache_after_save: bool = False
+
+    """
+    Whether to clear the NPU caching allocator after a checkpoint save.
+    This helps release temporary checkpoint buffers before training resumes.
+    """
+    empty_cache_after_save: bool = True
+
+
+@dataclass
 class JobConfig(BaseJobConfig):
     # pyrefly: ignore [bad-override]
     optimizer: Optimizer = field(default_factory=Optimizer)
@@ -167,3 +190,5 @@ class JobConfig(BaseJobConfig):
     training: Training = field(default_factory=Training)
     # pyrefly: ignore [bad-override]
     profiling: Profiling = field(default_factory=Profiling)
+    # pyrefly: ignore [bad-override]
+    checkpoint: Checkpoint = field(default_factory=Checkpoint)
