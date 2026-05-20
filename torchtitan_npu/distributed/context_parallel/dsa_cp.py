@@ -10,10 +10,7 @@ from torch.distributed._tensor import DTensor, Partial, Replicate, Shard
 from torch.distributed.device_mesh import DeviceMesh
 
 from torchtitan_npu.converters.kernels.dsa import SparseLightningIndexerKLLoss
-from torchtitan_npu.models.deepseek_v32.model.model import (
-    DSASparseAttention,
-    DSV32_SDPA,
-)
+from torchtitan_npu.models.deepseek_v32.model import DSASparseAttention, DSV32_SDPA
 
 
 INDEXER_GRAD_INDICES = [2, 3, 4]  # corresponding to LILossTrain.backward outputs
@@ -176,12 +173,8 @@ def dsa_forward_with_cp(
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
 
-    q_nope, q_pe = torch.split(
-        q, [self.model_args.kv_lora_rank, self.model_args.qk_rope_head_dim], dim=-1
-    )
-    k_nope, k_pe = torch.split(
-        k, [self.model_args.kv_lora_rank, self.model_args.qk_rope_head_dim], dim=-1
-    )
+    q_nope, q_pe = torch.split(q, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+    k_nope, k_pe = torch.split(k, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
 
     bsz = q.shape[0]
     actual_seq_len = torch.full(
@@ -259,7 +252,12 @@ def patch_dsa_for_context_parallel(
     for cls in (DSASparseAttention, DSV32_SDPA):
         cls.cp_mesh = cp_mesh
         if model_args is not None:
-            cls.model_args = model_args  # pyrefly: ignore [no-access]
+            cls.kv_lora_rank = model_args.layers[
+                0
+            ].attention.kv_lora_rank  # pyrefly: ignore [no-access]
+            cls.qk_rope_head_dim = model_args.layers[
+                0
+            ].attention.qk_rope_head_dim  # pyrefly: ignore [no-access]
         cls.tp_mesh = tp_mesh
         cls.compute_dsa_indexer_loss = (  # pyrefly: ignore [no-access]
             SparseLightningIndexerKLLoss()

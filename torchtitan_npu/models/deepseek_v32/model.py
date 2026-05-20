@@ -5,6 +5,7 @@
 
 import logging
 import math
+from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
@@ -14,13 +15,175 @@ from einops import rearrange
 from scipy.linalg import hadamard
 from torch import nn
 from torch.nn.attention import sdpa_kernel, SDPBackend
-from torchtitan.models.deepseek_v3.model.model import DeepSeekV3Model, TransformerBlock
-from torchtitan.protocols.model import AttentionMasksType
+from torchtitan.models.common.attention import AttentionMasksType
+from torchtitan.models.common.rmsnorm import RMSNorm as TorchTitanRMSNorm
+from torchtitan.models.deepseek_v3.model import (
+    Attention as DeepSeekV3Attention,
+    DeepSeekV3TransformerBlock,
+)
+from torchtitan.protocols.module import Module, ModuleDict
 
+from torchtitan_npu.models.deepseek_v3.model import DeepSeekV3ModelNpu
 from torchtitan_npu.train import reshape_for_broadcast
-from .args import DeepSeekV32ModelArgs
 
 logger = logging.getLogger()
+
+
+_Linear = Module.from_nn_module(nn.Linear)
+_LayerNorm = Module.from_nn_module(nn.LayerNorm)
+
+
+class DeepSeekV32ModelNpu(DeepSeekV3ModelNpu):
+    @dataclass(kw_only=True, slots=True)
+    class Config(DeepSeekV3ModelNpu.Config):
+        # Model-level v32 fields. Per-attention architecture knobs (index_*,
+        # enable_mla_absorb) live on ``Attention.Config`` defined later in this
+        # module. ``enable_indexer_loss`` stays here because it gates trainer
+        # -side logging (see ``torchtitan_npu.train``), not per-layer compute.
+        enable_indexer_loss: bool = True
+        save_format: str = "dcp"
+        save_expert_format: str | None = None
+        hf_save_dir: str | None = None
+        save_patch_enabled: bool = False
+        moe_impl: str = "standard"
+        num_mtp_modules: int = 0
+
+        def update_from_config(self, *, trainer_config, **kwargs) -> None:
+            DeepSeekV3ModelNpu.Config.update_from_config(
+                self, trainer_config=trainer_config, **kwargs
+            )
+            if not hasattr(trainer_config.training, "num_mtp_modules"):
+                return
+            new_mtp = trainer_config.training.num_mtp_modules
+            if new_mtp == self.num_mtp_modules:
+                return
+            if new_mtp < 0:
+                raise ValueError(f"num_mtp_modules must be >= 0, got {new_mtp}")
+            # Registry currently always builds with ``num_mtp_modules=0``
+            # (see ``_make_dsv32_model_config``). Refuse asymmetric updates
+            # so the layer list stays consistent with ``num_mtp_modules``.
+            if self.num_mtp_modules != 0:
+                raise ValueError(
+                    f"num_mtp_modules update not supported: registry built "
+                    f"{self.num_mtp_modules} MTP layers but trainer requests "
+                    f"{new_mtp}. Either match the registry value or set the "
+                    f"registry default to 0."
+                )
+            # Late import: ``__init__.py`` imports this module, so importing it
+            # at module top would create a cycle.
+            from torchtitan_npu.models.deepseek_v32 import _extend_dsv32_layers_with_mtp
+
+            n_dense_layers = sum(1 for l in self.layers if l.feed_forward is not None)
+            new_layers = _extend_dsv32_layers_with_mtp(
+                self.layers, n_dense_layers, new_mtp
+            )
+            ref_attn = self.layers[0].attention
+            for layer_cfg in new_layers:
+                layer_cfg.attention.rope_max_seq_len = ref_attn.rope_max_seq_len
+                layer_cfg.attention.rope_factor = ref_attn.rope_factor
+                layer_cfg.attention.rope_original_seq_len = (
+                    ref_attn.rope_original_seq_len
+                )
+            self.layers.extend(new_layers)
+            self.num_mtp_modules = new_mtp
+
+    def __init__(self, config: "DeepSeekV32ModelNpu.Config"):
+        nn.Module.__init__(self)
+        self.config = config
+        self.tok_embeddings = config.tok_embeddings.build()
+        self.rope = config.rope.build()
+        self.register_buffer("freqs_cis", self.rope.cache, persistent=False)
+        # pyrefly: ignore [bad-assignment]
+        self.norm = RMSNorm(config.dim)
+        self.output = config.output.build()
+
+        n_total = len(config.layers)
+        n_main = n_total - config.num_mtp_modules
+        self.layers = ModuleDict()
+        for layer_id, layer_cfg in enumerate(config.layers):
+            if layer_id < n_main:
+                self.layers[str(layer_id)] = TransformerBlockV32(
+                    layer_cfg, layer_id, n_total
+                )
+            else:
+                self.layers[str(layer_id)] = MTPModule(layer_cfg, layer_id, n_total)
+        self.num_mtp_modules = config.num_mtp_modules
+        self.n_main_layers = n_main
+        # [TODO] refactor it . ``model_args`` is the legacy attribute name read by
+        # parallelize.py state_dict_adapter.py and downstream tools. We alias it to
+        # the Config object; new callers should access fields via the Config tree
+        # (e.g. ``model_args.layers[0].attention.<...>``).
+        self.model_args = config
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        attention_masks: AttentionMasksType | None = None,
+        positions: torch.Tensor | None = None,
+    ):
+        """Forward pass for the Transformer model.
+
+        Args:
+            tokens (torch.Tensor): Input token indices if pipeline parallelism is not enabled.
+                If pipeline parallelism is enabled, this will be the input token indices
+                for the ranks on the first pipeline stage. This will be the activation of the
+                previous pipeline stage if the current rank is not on the first stage.
+            attention_masks: Optional masks for flex/varlen attention.
+            positions: Position ids for CP/TP; set by Trainer when context_parallel is enabled
+                (see torchtitan v0.2.2 prepare_context_parallel_input). Defaults to None.
+
+        Returns:
+            torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
+        """
+        residual = None
+        seq_len = tokens.shape[1]
+        # pyrefly: ignore [missing-attribute]
+        seq_len -= self.num_mtp_modules
+        h = (
+            self.tok_embeddings(tokens[:, :seq_len])
+            if self.tok_embeddings is not None
+            else tokens[:, :seq_len]
+        )
+        # Main model calculate
+        layer_id = 0
+        for layer in self.layers.values():
+            if layer_id < self.n_main_layers:
+                h, residual = layer(
+                    h, residual, self.freqs_cis, attention_masks, positions
+                )
+            else:
+                break
+            layer_id += 1
+        if residual is not None:
+            h = h + residual
+        prev_embed = h
+        h = self.norm(h) if self.norm is not None else h
+        output = self.output(h.float()) if self.output is not None else h
+        # pyrefly: ignore [missing-attribute]
+        if self.num_mtp_modules <= 0:
+            return output
+        else:
+            # pyrefly: ignore [missing-attribute]
+            output_list = [None] * (1 + self.num_mtp_modules)
+            output_list[0] = output
+        # MTP module calculate
+        # pyrefly: ignore [missing-attribute]
+        for mtp_layer_id in range(self.num_mtp_modules):
+            token_offset_id = mtp_layer_id + 1
+            token_end_idx = token_offset_id + seq_len
+            token_offset = tokens[:, token_offset_id:token_end_idx]
+            input_offset = self.tok_embeddings(token_offset)
+            layer_id = mtp_layer_id + self.n_main_layers
+            h, residual = self.layers[str(layer_id)](
+                input_offset, prev_embed, self.freqs_cis, attention_masks, positions
+            )
+            if residual is not None:
+                h = h + residual
+            prev_embed = h
+            h = self.norm(h) if self.norm is not None else h
+            output = self.output(h.float()) if self.output is not None else h
+            output_list[mtp_layer_id + 1] = output
+        return output_list
 
 
 def apply_rotary_emb(
@@ -51,12 +214,16 @@ def apply_rotary_emb(
     return y.to(dtype)
 
 
-class RMSNorm(nn.Module):
+class RMSNorm(TorchTitanRMSNorm):
     def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
+        nn.RMSNorm.__init__(
+            self,
+            dim,
+            eps=eps,
+            elementwise_affine=True,
+            dtype=torch.float32,
+        )
         self.dim = dim
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor):
         dtype = x.dtype
@@ -68,6 +235,11 @@ class RMSNorm(nn.Module):
     def reset_parameters(self):
         if self.weight is not None:
             nn.init.ones_(self.weight)
+
+    def _init_self_parameters(self) -> None:
+        # Bridge ``Module``'s default ``_param_init`` lookup to the legacy
+        # ``reset_parameters`` API used by this class.
+        self.reset_parameters()
 
 
 def hadamard_transform_ref(x, scale=1.0):
@@ -114,22 +286,20 @@ def bf16_index(q: torch.Tensor, weight: torch.Tensor, k: torch.Tensor) -> torch.
     return reduce_out
 
 
-class Indexer(torch.nn.Module):
-    def __init__(self, args: DeepSeekV32ModelArgs):
+class Indexer(Module):
+    def __init__(self, config: "Attention.Config"):
         super().__init__()
-        self.dim: int = args.dim
-        self.n_heads: int = args.index_n_heads
-        self.head_dim: int = args.index_head_dim
-        self.rope_head_dim: int = args.qk_rope_head_dim
-        self.index_topk: int = args.index_topk
-        self.q_lora_rank: int = args.q_lora_rank
-        self.wq_b = nn.Linear(
-            self.q_lora_rank, self.n_heads * self.head_dim, bias=False
-        )
-        self.wk = nn.Linear(self.dim, self.head_dim, bias=False)
-        self.k_norm = nn.LayerNorm(self.head_dim)
+        self.dim: int = config.dim
+        self.n_heads: int = config.index_n_heads
+        self.head_dim: int = config.index_head_dim
+        self.rope_head_dim: int = config.qk_rope_head_dim
+        self.index_topk: int = config.index_topk
+        self.q_lora_rank: int = config.q_lora_rank
+        self.wq_b = _Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
+        self.wk = _Linear(self.dim, self.head_dim, bias=False)
+        self.k_norm = _LayerNorm(self.head_dim)
         # weights_proj in the checkpoint is stored in bf16, while the parameters here are stored in fp32 for convenient.
-        self.weights_proj = nn.Linear(
+        self.weights_proj = _Linear(
             self.dim, self.n_heads, dtype=torch.float32, bias=False
         )
         self.softmax_scale = self.head_dim**-0.5
@@ -168,13 +338,6 @@ class Indexer(torch.nn.Module):
         weights = self.weights_proj(x) * self.n_heads**-0.5
         weights = weights * self.softmax_scale
         return q, weights, k, end_pos
-
-    def init_weights(self, init_std: float):
-        linear_list = [self.wq_b, self.wk, self.weights_proj]
-        linear_list.extend([self.wq_b, self.wk, self.weights_proj])
-        for linear in linear_list:
-            nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
-        self.k_norm.reset_parameters()
 
 
 LOSS_SCALE = torch.tensor(1.0)
@@ -274,7 +437,7 @@ class DSAIndexerLossLoggingHelper:
         logger.info(f"indexer loss: {loss.item()}")
 
 
-class DSAIndexerLoss(torch.nn.Module):
+class DSAIndexerLoss(Module):
     """Compute dsa indexer loss at sparse training stage
     Reference: https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/DeepSeek_V3_2.pdf
     Args:
@@ -335,7 +498,7 @@ def get_attn_scores(
     return attn
 
 
-class DSV32_SDPA(torch.nn.Module):  # noqa: N801
+class DSV32_SDPA(Module):  # noqa: N801
     """Wrapper around `F.scaled_dot_product_attention` to make it CP compatible.
 
     This wrapper is needed because `F.scaled_dot_product_attention` is not
@@ -349,9 +512,9 @@ class DSV32_SDPA(torch.nn.Module):  # noqa: N801
 
     sdpa_backends: ClassVar[list[SDPBackend]] = []
 
-    def __init__(self, model_args: DeepSeekV32ModelArgs) -> None:
+    def __init__(self, config: "Attention.Config") -> None:
         super().__init__()
-        self.model_args = model_args
+        self.config = config
         self.compute_dsa_indexer_loss = DSAIndexerLoss()
         if not self.sdpa_backends:
             # pyrefly: ignore [read-only]
@@ -457,44 +620,40 @@ class DSV32_SDPA(torch.nn.Module):  # noqa: N801
 DSASparseAttention = DSV32_SDPA
 
 
-class PreAttention(nn.Module):
+class PreAttention(Module):
     """
     Multi-head attention (MLA) module.
     """
 
-    def __init__(self, model_args: DeepSeekV32ModelArgs):
+    def __init__(self, config: "Attention.Config"):
         super().__init__()
-        self.dim = model_args.dim
-        self.n_heads = model_args.n_heads
-        self.q_lora_rank = model_args.q_lora_rank
-        self.kv_lora_rank = model_args.kv_lora_rank
-        self.qk_nope_head_dim = model_args.qk_nope_head_dim
-        self.qk_rope_head_dim = model_args.qk_rope_head_dim
-        self.qk_head_dim = model_args.qk_nope_head_dim + model_args.qk_rope_head_dim
-        self.v_head_dim = model_args.v_head_dim
-        self.enable_mla_absorb = model_args.enable_mla_absorb
-        self.n_layers = model_args.n_layers + model_args.num_mtp_modules
+        self.dim = config.dim
+        self.n_heads = config.n_heads
+        self.q_lora_rank = config.q_lora_rank
+        self.kv_lora_rank = config.kv_lora_rank
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+        self.v_head_dim = config.v_head_dim
+        self.enable_mla_absorb = config.enable_mla_absorb
 
-        self.wq_a = nn.Linear(self.dim, self.q_lora_rank, bias=False)
-        self.q_norm = nn.RMSNorm(self.q_lora_rank, eps=model_args.norm_eps)
-        self.wq_b = nn.Linear(
-            self.q_lora_rank, self.n_heads * self.qk_head_dim, bias=False
+        # v32 always uses LoRA query projection (q_lora_rank > 0).
+        assert config.wq_a is not None and config.wq_b is not None, (
+            "DeepSeek V3.2 requires q_lora_rank > 0; "
+            "Attention.Config must provide wq_a/wq_b"
         )
-        self.wkv_a = nn.Linear(
-            self.dim, self.kv_lora_rank + self.qk_rope_head_dim, bias=False
-        )
-        self.kv_norm = nn.RMSNorm(self.kv_lora_rank, eps=model_args.norm_eps)
-        self.wkv_b = nn.Linear(
-            self.kv_lora_rank,
-            self.n_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            bias=False,
-        )
+        self.wq_a = config.wq_a.build()
+        self.q_norm = config.q_norm.build()
+        self.wq_b = config.wq_b.build()
+        self.wkv_a = config.wkv_a.build()
+        self.kv_norm = config.kv_norm.build()
+        self.wkv_b = config.wkv_b.build()
         self.softmax_scale = self.qk_head_dim**-0.5
 
-        if model_args.max_seq_len > model_args.original_seq_len:
-            mscale = 0.1 * model_args.mscale * math.log(model_args.rope_factor) + 1.0
+        if config.rope_max_seq_len > config.rope_original_seq_len:
+            mscale = 0.1 * config.mscale * math.log(config.rope_factor) + 1.0
             self.softmax_scale = self.softmax_scale * mscale * mscale
-        self.indexer = Indexer(model_args)
+        self.indexer = Indexer(config)
 
     def forward(
         self,
@@ -603,28 +762,15 @@ class PreAttention(nn.Module):
                 w_uv_t,
             )
 
-    def init_weights(self, init_std: float):
-        linear_list = [
-            self.wkv_a,
-            self.wkv_b,
-        ]
-        linear_list.extend([self.wq_a, self.wq_b])
-        for linear in linear_list:
-            nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
-        self.indexer.init_weights(init_std)
-        self.kv_norm.reset_parameters()
-        if self.q_lora_rank > 0:
-            self.q_norm.reset_parameters()
 
-
-class PostAttention(nn.Module):
-    def __init__(self, model_args: DeepSeekV32ModelArgs):
+class PostAttention(Module):
+    def __init__(self, config: "Attention.Config", num_total_layers: int):
         super().__init__()
-        self.enable_mla_absorb = model_args.enable_mla_absorb
-        self.wo = nn.Linear(
-            model_args.n_heads * model_args.v_head_dim, model_args.dim, bias=False
-        )
-        self.n_layers = model_args.n_layers + model_args.num_mtp_modules
+        self.enable_mla_absorb = config.enable_mla_absorb
+        self.wo = config.wo.build()
+        # Used by DSAIndexerLossLoggingHelper.save_loss_to_tracker to size the
+        # per-layer loss vector. ``num_total_layers`` is dense layers + MTP modules.
+        self.n_layers = num_total_layers
 
     def forward(
         self,
@@ -648,16 +794,29 @@ class PostAttention(nn.Module):
         output = DSAIndexerLossAutoScaler.apply(output, loss)
         return output  # (bsz, seqlen, dim)
 
-    def init_weights(self, init_std: float):
-        nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
 
+class Attention(Module):
+    """DeepSeek V3.2 three-stage attention (Pre + sparse SDPA + Post).
 
-class Attention(nn.Module):
-    def __init__(self, model_args: DeepSeekV32ModelArgs):
+    Wraps an MLA-style ``PreAttention`` + the ``DSV32_SDPA`` sparse kernel +
+    ``PostAttention`` (which projects with ``wo`` and emits the indexer
+    auxiliary loss). Not a subclass of v3 ``Attention`` because the forward
+    path is fundamentally different.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(DeepSeekV3Attention.Config):
+        # v32-specific lightning indexer + MLA-absorb knobs.
+        index_n_heads: int = 64
+        index_head_dim: int = 128
+        index_topk: int = 2048
+        enable_mla_absorb: bool = True
+
+    def __init__(self, config: Config, num_total_layers: int):
         super().__init__()
-        self.pre_attention = PreAttention(model_args)
-        self.inner_attention = DSASparseAttention(model_args)
-        self.post_attention = PostAttention(model_args)
+        self.pre_attention = PreAttention(config)
+        self.inner_attention = DSASparseAttention(config)
+        self.post_attention = PostAttention(config, num_total_layers)
 
     def forward(
         self,
@@ -695,20 +854,37 @@ class Attention(nn.Module):
         final_output = self.post_attention(x, output, w_uv_t, loss, layer_id)
         return final_output
 
-    def init_weights(self, init_std: float):
-        self.pre_attention.init_weights(init_std)
-        self.post_attention.init_weights(init_std)
 
-
-class TransformerBlockV32(TransformerBlock):
+class TransformerBlockV32(DeepSeekV3TransformerBlock):
     """
     Transformer block with attention and feed-forward layers.
     """
 
-    def __init__(self, layer_id: int, model_args: DeepSeekV32ModelArgs):
-        super().__init__(layer_id, model_args)
-        # pyrefly: ignore [bad-assignment]
-        self.attention = Attention(model_args)
+    @dataclass(kw_only=True, slots=True)
+    class Config(DeepSeekV3TransformerBlock.Config):
+        # Tighten ``attention`` typing to the v32 sub-Config so trainer-side
+        # validation catches misconfigured layers early.
+        attention: "Attention.Config"
+
+    def __init__(self, config: Config, layer_id: int, num_total_layers: int):
+        # Skip ``DeepSeekV3TransformerBlock.__init__`` because v32 builds its
+        # own three-stage Attention; reuse the rest of the block's standard
+        # build for attention_norm / ffn_norm / moe / feed_forward.
+        nn.Module.__init__(self)
+        self.layer_id = layer_id
+        self.attention_norm = config.attention_norm.build()
+        self.ffn_norm = config.ffn_norm.build()
+        assert isinstance(
+            config.attention, Attention.Config
+        ), "TransformerBlockV32 requires attention to be Attention.Config"
+        self.attention = Attention(config.attention, num_total_layers)
+        self.moe_enabled = config.moe is not None
+        if self.moe_enabled:
+            assert config.moe is not None
+            self.moe = config.moe.build()
+        else:
+            assert config.feed_forward is not None
+            self.feed_forward = config.feed_forward.build()
 
     # pyrefly: ignore [bad-param-name-override]
     def forward(
@@ -751,14 +927,20 @@ class MTPModule(TransformerBlockV32):
     MTP block with linear projection and transformerblock layers.
     """
 
-    def __init__(self, layer_id: int, model_args: DeepSeekV32ModelArgs):
-        super().__init__(layer_id, model_args)
-        self.model_args = model_args
-        # pyrefly: ignore [bad-assignment]
-        self.attention = Attention(model_args)
-        self.enorm = RMSNorm(model_args.dim, eps=model_args.norm_eps)
-        self.hnorm = RMSNorm(model_args.dim, eps=model_args.norm_eps)
-        self.eh_proj = nn.Linear(2 * model_args.dim, model_args.dim, bias=False)
+    def __init__(
+        self,
+        config: "TransformerBlockV32.Config",
+        layer_id: int,
+        num_total_layers: int,
+    ):
+        super().__init__(config, layer_id, num_total_layers)
+        self._dim = config.attention.dim
+        # Reuse the per-layer kv_norm eps so MTP norm matches main attention
+        # numerics; v32 historically picked 1e-6 here.
+        eps = config.attention.kv_norm.eps
+        self.enorm = RMSNorm(self._dim, eps=eps)
+        self.hnorm = RMSNorm(self._dim, eps=eps)
+        self.eh_proj = _Linear(2 * self._dim, self._dim, bias=False)
 
     # pyrefly: ignore [bad-param-name-override]
     def forward(
@@ -795,106 +977,23 @@ class MTPModule(TransformerBlockV32):
             h = self.feed_forward(h)
         return h, residual
 
-    def init_weights(self, buffer_device: torch.device):
-        super().init_weights(buffer_device=buffer_device)
+    def init_states(
+        self,
+        *,
+        buffer_device: torch.device | None = None,
+    ) -> None:
+        # ``Module.init_states`` recurses into Module children. v32 plain
+        # nn.Module submodules (enorm/hnorm/eh_proj) are walked but their
+        # leaf params are not initialized by the framework — handle them here.
+        super().init_states(buffer_device=buffer_device)
         for norm in (self.enorm, self.hnorm):
             norm.reset_parameters()
-        final_out_std = self.model_args.dim**-0.5
+        final_out_std = self._dim**-0.5
         cutoff_factor = 3
-        if self.eh_proj is not None:
-            nn.init.trunc_normal_(
-                self.eh_proj.weight,
-                mean=0.0,
-                std=final_out_std,
-                a=-cutoff_factor * final_out_std,
-                b=cutoff_factor * final_out_std,
-            )
-
-
-class DeepSeekV32Model(DeepSeekV3Model):
-    """
-    DeepSeek-V3.2 Transformer model with attention and feed-forward layers.
-    """
-
-    def __init__(self, model_args: DeepSeekV32ModelArgs):
-        super().__init__(model_args)
-        self.layers = torch.nn.ModuleDict()
-        for layer_id in range(model_args.n_layers + model_args.num_mtp_modules):
-            if layer_id < model_args.n_layers:
-                self.layers[str(layer_id)] = TransformerBlockV32(layer_id, model_args)
-            else:
-                self.layers[str(layer_id)] = MTPModule(layer_id, model_args)
-        self.model_args = model_args
-        # pyrefly: ignore [bad-assignment]
-        self.norm = RMSNorm(model_args.dim)
-
-    def forward(
-        self,
-        tokens: torch.Tensor,
-        attention_masks: AttentionMasksType | None = None,
-        positions: torch.Tensor | None = None,
-    ):
-        """
-        Forward pass for the Transformer model.
-
-        Args:
-            tokens (torch.Tensor): Input token indices if pipeline parallelism is not enabled.
-                If pipeline parallelism is enabled, this will be the input token indices
-                for the ranks on the first pipeline stage. This will be the activation of the
-                previous pipeline stage if the current rank is not on the first stage.
-            attention_masks: Optional masks for flex/varlen attention.
-            positions: Position ids for CP/TP; set by Trainer when context_parallel is enabled
-                (see torchtitan v0.2.2 prepare_context_parallel_input). Defaults to None.
-
-        Returns:
-            torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
-        """
-        residual = None
-        seq_len = tokens.shape[1]
-        # pyrefly: ignore [missing-attribute]
-        seq_len -= self.model_args.num_mtp_modules
-        h = (
-            self.tok_embeddings(tokens[:, :seq_len])
-            if self.tok_embeddings is not None
-            else tokens[:, :seq_len]
+        nn.init.trunc_normal_(
+            self.eh_proj.weight,
+            mean=0.0,
+            std=final_out_std,
+            a=-cutoff_factor * final_out_std,
+            b=cutoff_factor * final_out_std,
         )
-        # Main model calculate
-        layer_id = 0
-        for layer in self.layers.values():
-            if layer_id < self.model_args.n_layers:
-                h, residual = layer(
-                    h, residual, self.freqs_cis, attention_masks, positions
-                )
-            else:
-                break
-            layer_id += 1
-        if residual is not None:
-            h = h + residual
-        prev_embed = h
-        h = self.norm(h) if self.norm is not None else h
-        output = self.output(h.float()) if self.output is not None else h
-        # pyrefly: ignore [missing-attribute]
-        if self.model_args.num_mtp_modules <= 0:
-            return output
-        else:
-            # pyrefly: ignore [missing-attribute]
-            output_list = [None] * (1 + self.model_args.num_mtp_modules)
-            output_list[0] = output
-        # MTP module calculate
-        # pyrefly: ignore [missing-attribute]
-        for mtp_layer_id in range(self.model_args.num_mtp_modules):
-            token_offset_id = mtp_layer_id + 1
-            token_end_idx = token_offset_id + seq_len
-            token_offset = tokens[:, token_offset_id:token_end_idx]
-            input_offset = self.tok_embeddings(token_offset)
-            layer_id = mtp_layer_id + self.model_args.n_layers
-            h, residual = self.layers[str(layer_id)](
-                input_offset, prev_embed, self.freqs_cis, attention_masks, positions
-            )
-            if residual is not None:
-                h = h + residual
-            prev_embed = h
-            h = self.norm(h) if self.norm is not None else h
-            output = self.output(h.float()) if self.output is not None else h
-            output_list[mtp_layer_id + 1] = output
-        return output_list

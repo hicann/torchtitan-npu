@@ -92,14 +92,26 @@ def get_npu_converter_config(name: str) -> Configurable.Config | None:
 def has_npu_converter(converters: list, name: str) -> bool:
     """Return True if ``converters`` contains an NPU converter Config registered under ``name``.
 
-    The registry attaches ``_patch_name`` to the dynamically-generated
-    *converter* class, and ``_owner`` to the *Config* class that points back at
-    it. ``converters`` contains Config instances, so we hop through ``_owner``
-    to read the name. Also accept the raw converter class on the off chance the
-    list ever contains them.
+    Recognises both registries:
+      * Legacy ``ConverterRegistry``: dynamically-generated converter class
+        carries ``_patch_name``; its ``Config`` carries ``_owner`` pointing
+        back at the converter class.
+      * New ``ModelCustomConfig`` registry (``npu_registry.py``): the
+        dynamically-generated converter class carries ``_model_config``
+        whose ``.name`` is the registered patch name; the ``Config`` again
+        carries ``_owner`` pointing at that converter class.
+
+    ``converters`` contains Config instances; hop through ``_owner`` to read
+    the name. Also accept the raw converter class on the off chance the list
+    ever contains them.
     """
     for c in converters:
         owner = getattr(c, "_owner", None) or c
+        # Legacy registry
         if getattr(owner, "_patch_name", None) == name:
+            return True
+        # New ModelCustomConfig registry
+        model_config = getattr(owner, "_model_config", None)
+        if model_config is not None and getattr(model_config, "name", None) == name:
             return True
     return False

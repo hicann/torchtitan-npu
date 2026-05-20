@@ -19,14 +19,6 @@ from torchtitan_npu.patches.torchtitan.activation_checkpoint import (
     _patched_apply_full_ac,
 )
 
-os.environ["CLOSE_MATMUL_K_SHIFT"] = "1"
-try:
-    from msprobe.pytorch import seed_all
-
-    seed_all(seed=1234, mode=True)
-except ImportError:
-    pass
-
 
 def main() -> None:
     """Main entry point for NPU training with new config system."""

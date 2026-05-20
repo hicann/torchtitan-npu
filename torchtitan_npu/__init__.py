@@ -29,13 +29,17 @@ def _apply_patches():
         hf_datasets,
         loss,
         optimizer,
+        pp_loss_normalize,
     )
 
-    # patching ops
-    from . import converters, ops  # noqa: F401  # noqa: F401
+    # patching model_converter and ops
+    from . import converters, ops  # noqa: F401
 
     # patching mxfp8/hif8
     from .converters import quant_converter  # noqa: F401
+
+    # module injection: register NPU-only model variants
+    from .models import deepseek_v32, deepseek_v4  # noqa: F401
 
     # patching context_parallel utils
     from .patches.distributed import (  # noqa: F401  # noqa: F401, F811
@@ -66,12 +70,10 @@ def _apply_patches():
     from .tools import flight_recorder, profiling  # noqa: F401
 
     new_set = set(titan_models._supported_models)
-    new_set.add("deepseek_v4")
+    new_set.update({"deepseek_v32", "deepseek_v4"})
     titan_models._supported_models = frozenset(new_set)
 
-    # module injection
-    from .models import deepseek_v4  # noqa: F401
-
+    _inject_module("torchtitan.models.deepseek_v32", deepseek_v32)
     _inject_module("torchtitan.models.deepseek_v4", deepseek_v4)
 
 

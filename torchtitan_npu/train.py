@@ -92,7 +92,7 @@ def _patch_train_step_for_dsv32_indexer_loss():
         model_cfg = getattr(self, "model_config", None)
         if model_cfg is not None and getattr(model_cfg, "enable_indexer_loss", False):
             # Import dynamically to avoid circular dependencies
-            from torchtitan_npu.models.deepseek_v32.model.model import (
+            from torchtitan_npu.models.deepseek_v32.model import (
                 DSAIndexerLossLoggingHelper,
             )
 
@@ -160,7 +160,7 @@ def _patch_init_for_dsa_set_loss_scale():
         scale = 1.0 / float(get_grad_accumulation_steps(self) * loss_degree)
         scale_tensor = torch.tensor(scale, device=self.device, dtype=torch.float32)
 
-        from torchtitan_npu.models.deepseek_v32.model.model import (
+        from torchtitan_npu.models.deepseek_v32.model import (
             DSAIndexerLossAutoScaler as DSAIndexerLossAutoScalerV32,
         )
 

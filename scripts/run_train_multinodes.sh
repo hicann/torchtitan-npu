@@ -62,12 +62,12 @@ if [[ $NODE_RANK == "" ]];then
 fi
 WORLD_SIZE=$(($NPUS_PER_NODE*$NNODES))
 
-set -ex
-
+set -exo pipefail
 
 NGPU=${NGPU:-"16"}
 RDZV_ID="dsv32_train_$(date +%Y%m%d)"
-CONFIG_FILE=${CONFIG_FILE:-"torchtitan_npu/models/deepseek_v32/train_configs/deepseek_v32_671b_61layers_4k_128die.toml"}
+MODULE=${MODULE:-"torchtitan_npu.models.deepseek_v32"}
+CONFIG=${CONFIG:-"deepseek_v32_671b_61layers_4k_128die"}
 TRAIN_FILE=${TRAIN_FILE:-"torchtitan_npu.entry"}
 time=$(date +%Y%m%d%H%M)
 logfile=dsv32_128die_${time}_node${NODE_RANK}_${LOCAL_HOST//./_}.log
@@ -78,4 +78,4 @@ TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
 TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE} \
 torchrun --nnodes=${NNODES} --node_rank=${NODE_RANK} --nproc_per_node=${NGPU} --master_addr=${MASTER_ADDR} --master_port=${MASTER_PORT} \
 --local-ranks-filter ${LOG_RANK} --role rank --tee 3 \
--m ${TRAIN_FILE} --job.config_file ${CONFIG_FILE} "$@" 2>&1 | tee -a logs/${logfile}
+-m ${TRAIN_FILE} --module ${MODULE} --config ${CONFIG} "$@" 2>&1 | tee -a logs/${logfile}

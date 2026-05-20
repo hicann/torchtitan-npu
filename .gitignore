@@ -41,6 +41,8 @@ Sessionx.vim
 # macOS dir files
 .DS_Store
 
+# torchtitan
+/torchtitan
 # agent
 .claude/skills
 .claude/CLAUDE.md

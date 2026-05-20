@@ -20,6 +20,8 @@ from torch.distributed.device_mesh import DeviceMesh
 from torchtitan.models.common.attention import ScaledDotProductAttention
 from torchtitan.tools.logging import logger
 
+from torchtitan_npu.converters.registry import has_npu_converter
+
 
 _orig_apply_cp_to_attention_module = titan_cp.apply_cp_to_attention_module
 
@@ -101,7 +103,7 @@ def validate_ulysses_configs(
 def validate_dsa_converters(
     *,
     job_config: object | None,
-    converters: list[str] | tuple[str, ...] | None = None,
+    converters: list | tuple | None = None,
 ) -> None:
     resolved_converters = converters
     if resolved_converters is None and job_config is not None:
@@ -109,7 +111,7 @@ def validate_dsa_converters(
         resolved_converters = (
             getattr(model_cfg, "converters", None) if model_cfg is not None else None
         )
-    if not resolved_converters or "npu_dsa" not in resolved_converters:
+    if not resolved_converters or not has_npu_converter(resolved_converters, "npu_dsa"):
         raise ValueError(
             '[dsa] attention_type="dsa" requires "npu_dsa" in converters. '
             f"Got converters={resolved_converters!r}."

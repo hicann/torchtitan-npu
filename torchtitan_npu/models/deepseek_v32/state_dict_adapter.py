@@ -14,22 +14,47 @@ from torchtitan_npu.tools.weight_utils import detect_input_format_by_path
 logger = logging.getLogger(__name__)
 
 
+def _first_moe_layer(model_config):
+    """Return the first ``layer.moe`` config, or ``None`` if all dense."""
+    return next(
+        (layer.moe for layer in model_config.layers if layer.moe is not None),
+        None,
+    )
+
+
+def _first_moe_index(model_config) -> int:
+    """Index of the first MoE layer (== count of leading dense layers).
+
+    Mirrors the legacy ``model_args.moe_args.first_k_dense`` semantics from
+    the pre-Config era. Returns the total layer count if every layer is dense.
+    """
+    return next(
+        (i for i, layer in enumerate(model_config.layers) if layer.moe is not None),
+        len(model_config.layers),
+    )
+
+
 class DeepSeekV32StateDictAdapter(DeepSeekV3StateDictAdapter):
-    def __init__(self, model_args, hf_assets_path: str | None = None):
-        super().__init__(model_args, hf_assets_path)
+    def __init__(self, model_config, hf_assets_path: str | None = None):
+        super().__init__(model_config, hf_assets_path)
 
         # key mapping
-        self._setup_v32_mappings(model_args)
+        self._setup_v32_mappings(model_config)
 
-        # configs
-        self.use_gmm = getattr(model_args.moe_args, "use_grouped_mm", False)
-        self.n_experts = model_args.moe_args.num_experts
-        self.first_k_dense = getattr(model_args.moe_args, "first_k_dense", 0)
+        # MoE config knobs derived from the Config tree.
+        moe = _first_moe_layer(model_config)
+        if moe is not None:
+            self.use_gmm = getattr(moe.experts, "use_grouped_mm", False)
+            self.n_experts = moe.experts.num_experts
+        else:
+            self.use_gmm = False
+            self.n_experts = 0
+        self.first_k_dense = _first_moe_index(model_config)
         self._input_format = "hf"
         self._input_expert_format = "standard"
 
         # apply checkpoint patch
-        self._setup_checkpoint_patch(model_args)
+        self._setup_checkpoint_patch(model_config)
 
     # pyrefly: ignore [bad-override]
     def get_hf_storage_reader(self, path: str, from_quantized: bool = False):
@@ -42,12 +67,12 @@ class DeepSeekV32StateDictAdapter(DeepSeekV3StateDictAdapter):
 
             return FileSystemReader(path)
 
-    def _setup_checkpoint_patch(self, model_args):
+    def _setup_checkpoint_patch(self, model_config):
         """setup checkpoint save patch"""
         try:
-            from ....tools import checkpoint_patch
+            from ...tools import checkpoint_patch
 
-            checkpoint_patch.configure_from_model_args(model_args, adapter=self)
+            checkpoint_patch.configure_from_model_args(model_config, adapter=self)
 
             if checkpoint_patch.is_enabled():
                 success = checkpoint_patch.apply_patch()
@@ -62,7 +87,7 @@ class DeepSeekV32StateDictAdapter(DeepSeekV3StateDictAdapter):
                 f"saving configs: {e}"
             )
 
-    def _setup_v32_mappings(self, model_args):
+    def _setup_v32_mappings(self, model_config):
         """
         Setup key maps for DeepSeek V3.2 with attention split to
         pre-attention, inner_attention, and post_attention.
@@ -72,7 +97,7 @@ class DeepSeekV32StateDictAdapter(DeepSeekV3StateDictAdapter):
         self._setup_attention_kvo_mappings()
 
         # MTP
-        if model_args.num_mtp_modules > 0:
+        if model_config.num_mtp_modules > 0:
             self.from_hf_map.update(
                 {
                     "model.layers.{}.enorm.weight": "layers.{}.enorm.weight",

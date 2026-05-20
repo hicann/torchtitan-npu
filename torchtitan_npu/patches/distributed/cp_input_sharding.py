@@ -32,10 +32,13 @@ def _is_custom_cp_target(trainer) -> bool:
     if "deepseek_v32" not in model_name:
         return False
 
-    if not getattr(trainer.model_args, "enable_indexer_loss", False):
+    model_config = getattr(trainer, "model_config", None)
+    if model_config is None:
+        return False
+    if not getattr(model_config, "enable_indexer_loss", False):
         return False
 
-    attn_type = getattr(trainer.model_args, "attn_type", "sdpa")
+    attn_type = getattr(model_config, "attn_type", "sdpa")
     return attn_type in ("sdpa", "dsa")
 
 

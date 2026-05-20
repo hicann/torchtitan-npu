@@ -10,19 +10,21 @@ import torch.nn as nn
 
 import torch_npu
 
+from torchtitan.protocols.module import Module
+
 from torchtitan_npu.patches.torchtitan.activation_checkpoint import (
     _indexer_loss_need_compute,
 )
 
-from ..base_converter import BaseConverter
 from ..convert_utils import replace_methods
-from ..registry import register_npu_converter
+from ..model_custom_interface import ModelCustomConfig, ModelCustomConverter
+from ..npu_registry import register_model_converter
 
 
 logger = logging.getLogger(__name__)
 
 
-class SparseLightningIndexerKLLoss(nn.Module):
+class SparseLightningIndexerKLLoss(Module):
     def __init__(self):
         super().__init__()
 
@@ -234,10 +236,10 @@ def dsa_forward(
 
     # Split q_nope / q_pe
     q_nope, q_pe = torch.split(
-        q, [self.model_args.kv_lora_rank, self.model_args.qk_rope_head_dim], dim=-1
+        q, [self.config.kv_lora_rank, self.config.qk_rope_head_dim], dim=-1
     )
     k_nope, k_pe = torch.split(
-        k, [self.model_args.kv_lora_rank, self.model_args.qk_rope_head_dim], dim=-1
+        k, [self.config.kv_lora_rank, self.config.qk_rope_head_dim], dim=-1
     )
 
     bsz = q.shape[0]
@@ -287,35 +289,29 @@ def dsa_forward(
     return loss, output  # pyrefly: ignore [bad-return]
 
 
-@register_npu_converter("npu_dsa")
-class DSAKernel(BaseConverter):
+_DSV32_MODEL_PACKAGE = "torchtitan_npu.models.deepseek_v32"
 
-    MODEL_PACKAGE = "torchtitan_npu.models.deepseek_v32"
-    SUPPORTED_MODELS = {"deepseek_v32"}
-    SUPPORTED_ACTIVATION_CHECKPOINT = {"none", "full"}
 
-    @classmethod
-    def is_compatible(cls, job_config, model_name):
-        mode = job_config.activation_checkpoint.mode
-        if mode not in cls.SUPPORTED_ACTIVATION_CHECKPOINT:
-            raise ValueError(
-                f"Patch `npu_dsa` is NOT compatible with activation checkpoint mode '{mode}'\n"
-                f"Supported activation checkpoint mode: {cls.SUPPORTED_ACTIVATION_CHECKPOINT}"
+class NpuDSAConverter(ModelCustomConverter):
+    def convert(self, model: nn.Module) -> None:
+        if self.model_name != "deepseek_v32":
+            logger.info(
+                f"NpuDSAConverter: skipped for model {self.model_name!r} "
+                f"(only deepseek_v32 is supported)"
             )
-        return super().is_compatible(job_config, model_name)
+            return
 
-    @classmethod
-    def apply(cls, model: nn.Module, model_name: str, **kwargs) -> int:
         count = replace_methods(
-            "DSV32_SDPA", "forward", dsa_forward, package=cls.MODEL_PACKAGE
+            "DSV32_SDPA", "forward", dsa_forward, package=_DSV32_MODEL_PACKAGE
         )
         logger.info(f"  [DSV32_SDPA forward] Applied {count} replacement(s)")
         logger.info(
             "  Only matrix absorb mode is supported, and LI Loss is enabled by default."
         )
 
-        # If tp is no enabled, then the indexer_loss patch in deepseek_v32_parallelize.py won't be applied
-        # The patch is applied here as a supplement
+        # When TP is disabled the indexer_loss patch in deepseek_v32_parallelize.py
+        # is never applied; install ``SparseLightningIndexerKLLoss`` here as a
+        # fallback so single-device runs also compute the indexer loss.
         # pyrefly: ignore [not-callable]
         for transformer_block in model.layers.values():
             # pyrefly: ignore [missing-attribute]
@@ -326,4 +322,8 @@ class DSAKernel(BaseConverter):
                 inner_attention.compute_dsa_indexer_loss = (
                     SparseLightningIndexerKLLoss()
                 )
-        return count
+
+
+@register_model_converter("npu_dsa")
+class DSAModelConfig(ModelCustomConfig):
+    model_converter = NpuDSAConverter

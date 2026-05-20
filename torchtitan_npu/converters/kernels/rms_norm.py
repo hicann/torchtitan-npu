@@ -33,7 +33,9 @@ class NPURMSNorm(RMSNorm):
     def __init__(self, parent: RMSNorm):
         # Shallow copy of parent's __dict__ is intentional here
         self.__dict__.update(parent.__dict__)
-        self.Config.eps = _get_eps(parent)
+        # ``parent.eps`` may be missing/None on nn.RMSNorm; normalize via _get_eps
+        # so forward() sees a clean float (or None to fall back to dtype eps).
+        self.eps = _get_eps(parent)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Matches the default implementation of nn.RMSNorm:
@@ -41,6 +43,12 @@ class NPURMSNorm(RMSNorm):
         # - Otherwise, use the machine epsilon of the current input `x`.
         resolved_eps = self.eps if self.eps is not None else torch.finfo(x.dtype).eps
         return torch_npu.npu_rms_norm(x, self.weight, resolved_eps)[0]
+
+    def _init_self_parameters(self) -> None:
+        if getattr(self, "_param_init", None) is not None:
+            super()._init_self_parameters()
+        else:
+            self.reset_parameters()
 
 
 class NpuRMSNormConverter(ModelCustomConverter):

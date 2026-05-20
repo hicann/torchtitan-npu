@@ -15,15 +15,19 @@ Usage:
     python tests/smoke_tests/integration_test.py ./outputs
     python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v3_base
     python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v4_base
+    python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v32_base
     python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v3_tp
     python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v4_tp
+    python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v32_tp
     python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v4_fsdp_ep
+    python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v32_fsdp_ep
     python tests/smoke_tests/integration_test.py ./outputs --ngpu 4
 """
 
 import argparse
 import logging
 import os
+import shlex
 import subprocess
 import time
 from collections.abc import Sequence
@@ -60,6 +64,8 @@ _DEEPSEEK_V3_MODULE = "torchtitan_npu.models.deepseek_v3"
 _DEEPSEEK_V3_CONFIG = "deepseek_v3_smoketest"
 _DEEPSEEK_V4_MODULE = "torchtitan_npu.models.deepseek_v4"
 _DEEPSEEK_V4_CONFIG = "deepseek_v4_smoketest"
+_DEEPSEEK_V32_MODULE = "tests.smoke_tests"
+_DEEPSEEK_V32_CONFIG = "deepseek_v32_smoketest"
 _NPU_TRAIN_FILE = "torchtitan_npu.entry"
 
 
@@ -79,9 +85,7 @@ def _build_cmd(
 
     all_ranks = ",".join(map(str, range(test_flavor.ngpu)))
 
-    cmd = (
-        f"NGPU={test_flavor.ngpu} LOG_RANK={all_ranks} " f"bash ./scripts/run_train.sh"
-    )
+    cmd = f"NGPU={test_flavor.ngpu} LOG_RANK={all_ranks} " "bash ./scripts/run_train.sh"
 
     # Append dump_folder
     cmd += " " + dump_folder_arg
@@ -96,7 +100,8 @@ def _build_cmd(
 
     # Save logs
     log_path = f"{dump_folder}/test.log"
-    cmd += f" 2>&1 | tee {log_path}"
+    log_filter = os.path.join(os.path.dirname(__file__), "filter_smoke_log.py")
+    cmd += f" 2>&1 | python {shlex.quote(log_filter)} | tee {log_path}"
 
     return cmd
 
@@ -203,6 +208,17 @@ def _base_tests() -> List[OverrideDefinitions]:
             "deepseek_v4_base",
             ngpu=2,
         ),
+        OverrideDefinitions(
+            [
+                [
+                    f"--module {_DEEPSEEK_V32_MODULE}",
+                    f"--config {_DEEPSEEK_V32_CONFIG}",
+                ]
+            ],
+            "DeepSeek V3.2 BASE",
+            "deepseek_v32_base",
+            ngpu=2,
+        ),
     ]
 
 
@@ -280,6 +296,18 @@ def _ep_tests() -> List[OverrideDefinitions]:
             ],
             "DeepSeek V4 FSDP+EP",
             "deepseek_v4_fsdp_ep",
+            ngpu=2,
+        ),
+        OverrideDefinitions(
+            [
+                [
+                    f"--module {_DEEPSEEK_V32_MODULE}",
+                    f"--config {_DEEPSEEK_V32_CONFIG}",
+                    "--parallelism.expert_parallel_degree 2",
+                ]
+            ],
+            "DeepSeek V3.2 FSDP+EP",
+            "deepseek_v32_fsdp_ep",
             ngpu=2,
         ),
     ]
