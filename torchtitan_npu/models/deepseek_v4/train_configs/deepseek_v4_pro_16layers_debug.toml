@@ -33,7 +33,8 @@ converters = ["npu_rms_norm", "npu_permute", "npu_gmm", "npu_rope", "deepseek_v4
 name = "AdamW"
 lr = 1e-5
 eps = 1e-6
-swap_optimizer = true # swap optimizer between host and device to save device memory during training
+virtual_optimizer = true  # Virtual optimizer to allocate virtual memory and reduce device memory footprint during training
+virtual_optimizer_size = "all"
 
 [lr_scheduler]
 warmup_steps = 400 # lr scheduler warm up, normally 20% of the train steps

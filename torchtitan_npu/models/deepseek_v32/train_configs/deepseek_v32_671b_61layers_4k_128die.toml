@@ -41,8 +41,8 @@ lr = 7.3e-6
 eps = 1e-6
 weight_decay = 0.1
 beta2 = 0.95
-swap_optimizer = true   # swap optimizer between host and device to save device memory during training
-swap_optimizer_times = 16
+virtual_optimizer = true  # Virtual optimizer to allocate virtual memory and reduce device memory footprint during training
+virtual_optimizer_size = "all"
 
 [lr_scheduler]
 warmup_steps = 200  # lr scheduler warm up, normally 20% of the train steps

@@ -28,6 +28,8 @@ converters = ["npu_rms_norm", "npu_rope", "npu_permute", "npu_gmm"]
 name = "AdamW"
 lr = 2.2e-4
 eps = 1e-8
+virtual_optimizer = true  # Virtual optimizer to allocate virtual memory and reduce device memory footprint during training
+virtual_optimizer_size = "all"
 
 [lr_scheduler]
 warmup_steps = 4  # lr scheduler warm up, normally 20% of the train steps

@@ -188,6 +188,8 @@ class VirtualAllocator:
 
     def _get_swap_memory(self, p: torch.Tensor):
         """Internal: Logic for NPU swapped memory allocation."""
+        if p.numel() == 0:
+            return torch.zeros_like(p)
         if not hasattr(torch_npu, "empty_with_swapped_memory"):
             return self.get_memory(p)
         try:
