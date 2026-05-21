@@ -427,13 +427,14 @@ def apply_non_moe_tp(
     )
 
     indexer_plan = prepare_module_input_output(
-        input_layouts=(Replicate(), Replicate(), Replicate(), Replicate(), None),
+        # Indexer.forward takes 4 positional inputs (x, qr, freqs_cis, hadamard_mat);
+        # `positions` is a keyword-only arg and is not seen by the TP pre-hook.
+        input_layouts=(Replicate(), Replicate(), Replicate(), Replicate()),
         desired_input_layouts=(
             Replicate(),
             Replicate(),
             Replicate(),
             Replicate(),
-            None,
         ),
         use_local_input=True,
         output_layouts=(Replicate(), Replicate(), Replicate()),
