@@ -29,6 +29,34 @@ def _make_moe_args() -> MoEArgs:
     )
 
 
+def _make_v4_pro_debug_moe_args() -> MoEArgs:
+    return MoEArgs(
+        num_experts=16,
+        num_shared_experts=1,
+        top_k=6,
+        score_func="sqrtsoftplus",
+        route_norm=True,
+        score_before_experts=False,
+        use_grouped_mm=True,
+        n_hash_layers=3,
+        swiglu_limit=10,
+    )
+
+
+def _make_v4_pro_61_layers_moe_args() -> MoEArgs:
+    return MoEArgs(
+        num_experts=384,
+        num_shared_experts=1,
+        top_k=6,
+        score_func="sqrtsoftplus",
+        route_norm=True,
+        score_before_experts=False,
+        use_grouped_mm=True,
+        n_hash_layers=3,
+        swiglu_limit=10,
+    )
+
+
 def _make_smoke_moe_args() -> MoEArgs:
     return MoEArgs(
         num_experts=8,
@@ -197,10 +225,84 @@ def _285b_debug_43_layers() -> DeepSeekV4Model.Config:
     )
 
 
+def _v4_pro_debug_16_layers() -> DeepSeekV4Model.Config:
+    return DeepSeekV4Model.Config(
+        vocab_size=129280,
+        n_layers=16,
+        n_heads=128,
+        max_batch_size=4,
+        max_seq_len=4096,
+        dim=7168,
+        moe_inter_dim=3072,
+        head_dim=512,
+        rope_head_dim=64,
+        q_lora_rank=1536,
+        o_lora_rank=1024,
+        o_groups=16,
+        window_size=128,
+        compress_ratios=(128,) + (128, 4) * 30,
+        moe_args=_make_v4_pro_debug_moe_args(),
+        hc_sinkhorn_iters=20,
+        hc_mult=4,
+        hc_eps=1e-6,
+        compress_rope_theta=160000,
+        original_seq_len=65536,
+        rope_theta=10000,
+        rope_factor=16,
+        beta_fast=32,
+        beta_slow=1,
+        enable_indexer_loss=True,
+        index_n_heads=64,
+        index_head_dim=128,
+        index_topk=1024,
+        save_format="hf",
+        save_expert_format="gmm",
+        hf_save_dir=None,
+    )
+
+
+def _v4_pro_debug_61_layers() -> DeepSeekV4Model.Config:
+    return DeepSeekV4Model.Config(
+        vocab_size=129280,
+        n_layers=61,
+        n_heads=128,
+        max_batch_size=4,
+        max_seq_len=4096,
+        dim=7168,
+        moe_inter_dim=3072,
+        head_dim=512,
+        rope_head_dim=64,
+        q_lora_rank=1536,
+        o_lora_rank=1024,
+        o_groups=16,
+        window_size=128,
+        compress_ratios=(128,) + (128, 4) * 30,
+        moe_args=_make_v4_pro_61_layers_moe_args(),
+        hc_sinkhorn_iters=20,
+        hc_mult=4,
+        hc_eps=1e-6,
+        compress_rope_theta=160000,
+        original_seq_len=65536,
+        rope_theta=10000,
+        rope_factor=16,
+        beta_fast=32,
+        beta_slow=1,
+        enable_indexer_loss=True,
+        index_n_heads=64,
+        index_head_dim=128,
+        index_topk=1024,
+        save_format="hf",
+        save_expert_format="gmm",
+        hf_save_dir=None,
+    )
+
+
 deepseekv4_configs = {
     "smoketest": _smoketest_model,
     "285B_debug_4_layers": _285b_debug_4_layers,
     "285B_debug_43_layers": _285b_debug_43_layers,
+    "v4_pro_debug_16_layers": _v4_pro_debug_16_layers,
+    "v4_pro_debug_61_layers": _v4_pro_debug_61_layers,
 }
 
 

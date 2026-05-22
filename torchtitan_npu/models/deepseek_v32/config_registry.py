@@ -7,7 +7,7 @@
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.config import ActivationCheckpointConfig
+from torchtitan.config import ActivationCheckpointConfig, DebugConfig
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.protocols.model_converter import ModelConvertersContainer
 
@@ -38,6 +38,7 @@ def deepseek_v32_671b_4layers_debug() -> TrainerConfig:
     return TrainerConfig(
         hf_assets_path="./checkpoint/DeepSeekV3.2",
         model_spec=model_registry("671B_debug_4_layers"),
+        debug=DebugConfig(print_config=True),
         model_converters=ModelConvertersContainer.Config(
             converters=_default_converters()
         ),
@@ -104,6 +105,7 @@ def deepseek_v32_671b_61layers_4k_128die() -> TrainerConfig:
     return TrainerConfig(
         hf_assets_path="./checkpoint/DeepSeekV3.2",
         model_spec=model_registry("671B_debug_128die"),
+        debug=DebugConfig(print_config=True),
         model_converters=ModelConvertersContainer.Config(
             converters=_default_converters()
         ),
@@ -159,6 +161,7 @@ def deepseek_v32_671b_61layers_32k_128die() -> TrainerConfig:
     return TrainerConfig(
         hf_assets_path="./checkpoint/DeepSeekV3.2",
         model_spec=model_registry("671B_debug_128die"),
+        debug=DebugConfig(print_config=True),
         model_converters=ModelConvertersContainer.Config(
             converters=_default_converters()
         ),

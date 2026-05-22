@@ -7,7 +7,11 @@
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.config import ActivationCheckpointConfig, CompileConfig
+from torchtitan.config import (
+    ActivationCheckpointConfig, 
+    CompileConfig, 
+    DebugConfig
+)
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.protocols.model_converter import ModelConvertersContainer
 
@@ -41,6 +45,7 @@ def deepseek_v4_285b_debug_4_layers() -> TrainerConfig:
     return TrainerConfig(
         hf_assets_path="./tests/assets/tokenizer/deepseekv4_tokenizer",
         model_spec=model_registry("285B_debug_4_layers"),
+        debug=DebugConfig(print_config=True, moe_force_load_balance=True),
         model_converters=ModelConvertersContainer.Config(
             converters=_default_converters()
         ),
@@ -99,6 +104,7 @@ def deepseek_v4_285b_43layers_4k_128die() -> TrainerConfig:
     return TrainerConfig(
         hf_assets_path="./tests/assets/tokenizer/deepseekv4_tokenizer",
         model_spec=model_registry("285B_debug_43_layers"),
+        debug=DebugConfig(print_config=True),
         model_converters=ModelConvertersContainer.Config(
             converters=_default_converters()
         ),
@@ -161,10 +167,150 @@ def deepseek_v4_285b_43layers_4k_128die() -> TrainerConfig:
     )
 
 
+def deepseek_v4_pro_debug_16_layers() -> TrainerConfig:
+    return TrainerConfig(
+        hf_assets_path="./tests/assets/tokenizer/deepseek_v4_pro_tokenizer",
+        model_spec=model_registry("v4_pro_debug_16_layers"),
+        debug=DebugConfig(print_config=True, moe_force_load_balance=True),
+        model_converters=ModelConvertersContainer.Config(
+            converters=_default_converters()
+        ),
+        metrics=MetricsProcessor.Config(log_freq=1),
+        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
+        optimizer=OptimizerConfig(
+            name="AdamW",
+            lr=1e-5,
+            eps=1e-6,
+            swap_optimizer=True,
+        ),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=4,
+            decay_ratio=0.8,
+            decay_type="cosine",
+            min_lr_factor=0.01,
+        ),
+        training=TrainingConfig(
+            local_batch_size=1,
+            seq_len=4096,
+            max_norm=1.0,
+            steps=20,
+            num_mtp_modules=1,
+        ),
+        parallelism=ParallelismConfig(
+            data_parallel_replicate_degree=1,
+            data_parallel_shard_degree=-1,
+            fsdp_reshard_after_forward="always",
+            tensor_parallel_degree=1,
+            enable_async_tensor_parallel=False,
+            pipeline_parallel_degree=1,
+            pipeline_parallel_schedule="Interleaved1F1B",
+            expert_parallel_degree=16,
+            expert_tensor_parallel_degree=1,
+            context_parallel_degree=1,
+        ),
+        checkpoint=CheckpointManager.Config(
+            enable=False,
+            folder="checkpoint",
+            load_step=0,
+            interval=500,
+            last_save_model_only=True,
+            load_only=True,
+            initial_load_in_hf=False,
+            initial_load_path="/data/models/deepseek-v4-pro-bfloat16",
+            export_dtype="float32",
+            async_mode="disabled",
+        ),
+        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
+        compile=CompileConfig(enable=False, components=["model", "loss"]),
+        profiling=ProfilingConfig(
+            enable_profiling=False,
+            enable_online_parse=False,
+            profile_ranks=[0],
+            profile_step_start=6,
+            profile_step_end=7,
+            profile_record_shapes=True,
+            profile_with_memory=True,
+            enable_memory_snapshot=False,
+            save_memory_snapshot_folder="memory_snapshot",
+        ),
+    )
+
+
+def deepseek_v4_pro_debug_61_layers_4k_384die() -> TrainerConfig:
+    return TrainerConfig(
+        hf_assets_path="./tests/assets/tokenizer/deepseek_v4_pro_tokenizer",
+        model_spec=model_registry("v4_pro_debug_61_layers"),
+        debug=DebugConfig(print_config=True, moe_force_load_balance=True),
+        model_converters=ModelConvertersContainer.Config(
+            converters=_default_converters()
+        ),
+        metrics=MetricsProcessor.Config(log_freq=1),
+        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
+        optimizer=OptimizerConfig(
+            name="AdamW",
+            lr=1e-5,
+            eps=1e-6,
+            swap_optimizer=True,
+        ),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=400,
+            decay_ratio=0.8,
+            decay_type="cosine",
+            min_lr_factor=0.01,
+        ),
+        training=TrainingConfig(
+            global_batch_size=384,
+            local_batch_size=1,
+            seq_len=4096,
+            max_norm=1.0,
+            steps=2000,
+            num_mtp_modules=1,
+        ),
+        parallelism=ParallelismConfig(
+            data_parallel_replicate_degree=1,
+            data_parallel_shard_degree=-1,
+            fsdp_reshard_after_forward="always",
+            tensor_parallel_degree=1,
+            enable_async_tensor_parallel=False,
+            pipeline_parallel_degree=1,
+            pipeline_parallel_schedule="Interleaved1F1B",
+            expert_parallel_degree=384,
+            expert_tensor_parallel_degree=1,
+            context_parallel_degree=1,
+        ),
+        checkpoint=CheckpointManager.Config(
+            enable=False,
+            folder="checkpoint",
+            load_step=0,
+            initial_load_in_hf=True,
+            initial_load_path="/data/models/deepseek-v4-pro-bfloat16",
+            interval=10000,
+            last_save_model_only=True,
+            load_only=True,
+            export_dtype="float32",
+            async_mode="disabled",
+        ),
+        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
+        compile=CompileConfig(enable=True, components=["model", "loss"]),
+        profiling=ProfilingConfig(
+            enable_profiling=False,
+            enable_online_parse=False,
+            profile_ranks=[0],
+            profile_step_start=6,
+            profile_step_end=7,
+            profile_record_shapes=True,
+            profile_with_memory=True,
+            enable_memory_snapshot=False,
+            save_memory_snapshot_folder="memory_snapshot",
+        ),
+    )
+
+
 def deepseek_v4_smoketest() -> TrainerConfig:
     return TrainerConfig(
         hf_assets_path="./tests/assets/tokenizer/deepseekv4_tokenizer",
         model_spec=model_registry("smoketest"),
+        debug=DebugConfig(print_config=True),
         model_converters=ModelConvertersContainer.Config(converters=[]),
         metrics=MetricsProcessor.Config(log_freq=1),
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
