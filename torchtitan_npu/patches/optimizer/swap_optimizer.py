@@ -25,6 +25,7 @@ import torchtitan
 import torchtitan.components.optimizer
 from torch.distributed.checkpoint.state_dict import _get_fqns
 from torch.distributed.tensor import DTensor
+from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 from torch.optim import Optimizer
 from torch.optim.optimizer import _use_grad_for_differentiable
 from torchtitan.components.optimizer import OptimizersContainer
@@ -61,6 +62,25 @@ def wrap_like_param(local_tensor: torch.Tensor, tensor):
             shape=tensor.size(),
             stride=tensor.stride(),
             run_check=False,
+        )
+    return local_tensor
+
+
+def wrap_like_param_without_device_move(local_tensor: torch.Tensor, tensor):
+    if isinstance(tensor, DTensor):
+        spec = DTensorSpec(
+            tensor.device_mesh,
+            tensor.placements,
+            tensor_meta=TensorMeta(
+                shape=tensor.size(),
+                stride=tensor.stride(),
+                dtype=local_tensor.dtype,
+            ),
+        )
+        return DTensor(
+            local_tensor.view_as(local_tensor),
+            spec,
+            requires_grad=local_tensor.requires_grad,
         )
     return local_tensor
 
@@ -309,7 +329,7 @@ class SwapOptimizersContainer(OptimizersContainer):
         else:
             cpu_tensor = local_tensor.detach().cpu()
         if isinstance(like_param, DTensor):
-            return wrap_like_param(cpu_tensor, like_param)
+            return wrap_like_param_without_device_move(cpu_tensor, like_param)
         return cpu_tensor
 
     @classmethod

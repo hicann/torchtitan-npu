@@ -248,6 +248,15 @@ def test_state_dict_preserves_dtensor_layout_for_cpu_cache(monkeypatch):
         "param_to_cpu_states_map",
         {param: {"exp_avg": cpu_exp_avg}},
     )
+    monkeypatch.setattr(
+        swap_optimizer.DTensor,
+        "from_local",
+        staticmethod(
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("CPU-cache state_dict must not call DTensor.from_local")
+            )
+        ),
+    )
 
     value = swap_optimizer.SwapOptimizersContainer._state_value_for_state_dict(
         param,
