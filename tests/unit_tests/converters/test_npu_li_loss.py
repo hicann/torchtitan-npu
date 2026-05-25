@@ -3,24 +3,17 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import sys
-import types
 import unittest
 from unittest.mock import MagicMock
 
 import torch
 
-# Inject fake mindspeed module hierarchy before importing the adapter
+import torchtitan_npu.converters.kernels.deepseek_v4_sfa as sfa_mod
+
 _mock_fused_fn = MagicMock()
-_mock_ops_mod = types.ModuleType(
-    "mindspeed.ops.npu_sparse_lightning_indexer_grad_kl_loss"
-)
-_mock_ops_mod.npu_sparse_lightning_indexer_grad_kl_loss = _mock_fused_fn
-sys.modules.setdefault("mindspeed", types.ModuleType("mindspeed"))
-sys.modules.setdefault("mindspeed.ops", types.ModuleType("mindspeed.ops"))
-sys.modules.setdefault(
-    "mindspeed.ops.npu_sparse_lightning_indexer_grad_kl_loss", _mock_ops_mod
-)
+_mock_kl_op = MagicMock()
+_mock_kl_op.npu_sparse_lightning_indexer_grad_kl_loss = _mock_fused_fn
+sfa_mod._kl_op = _mock_kl_op
 
 
 class TestLILossKernel(unittest.TestCase):

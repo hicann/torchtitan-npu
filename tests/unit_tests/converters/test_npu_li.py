@@ -3,23 +3,18 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import sys
-import types
 import unittest
 from unittest.mock import MagicMock
 
 import torch
 
+import torchtitan_npu.converters.kernels.deepseek_v4_sfa as sfa_mod
 from torchtitan_npu.converters.kernels.deepseek_v4_sfa import NpuLiCompute
 
 _mock_fused_fn = MagicMock()
-
-_mock_ops_mod = types.ModuleType("mindspeed.ops.npu_lightning_indexer")
-_mock_ops_mod.npu_lightning_indexer = _mock_fused_fn
-
-sys.modules.setdefault("mindspeed", types.ModuleType("mindspeed"))
-sys.modules.setdefault("mindspeed.ops", types.ModuleType("mindspeed.ops"))
-sys.modules.setdefault("mindspeed.ops.npu_lightning_indexer", _mock_ops_mod)
+_mock_li_op = MagicMock()
+_mock_li_op.npu_lightning_indexer = _mock_fused_fn
+sfa_mod._li_op = _mock_li_op
 
 
 class TestLIKernel(unittest.TestCase):
@@ -45,7 +40,7 @@ class TestLIKernel(unittest.TestCase):
         self.mock_parent.ratio = self.ratio
 
     def test_npu_li_compute_forward_logic(self):
-        """Test NpuLiCompute.forward calls mindspeed lightning indexer correctly."""
+        """Test NpuLiCompute.forward calls lightning indexer correctly."""
         mock_li_op = _mock_fused_fn
         mock_li_op.reset_mock()
 

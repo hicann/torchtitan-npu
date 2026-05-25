@@ -3,30 +3,16 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import sys
-import types
 import unittest
 from unittest.mock import MagicMock
 
 import torch
 
+import torchtitan_npu.converters.kernels.deepseek_v4_sfa as sfa_mod
 from torchtitan_npu.converters.kernels.deepseek_v4_sfa import NpuSparseAttention
 
 _mock_fused_fn = MagicMock()
-
-
-class MockSparseAttn:
-    apply = _mock_fused_fn
-
-
-_mock_ops_mod = types.ModuleType("mindspeed.ops.npu_sparse_attn_shared_kv")
-
-_mock_ops_mod.SparseAttnSharedKV = MockSparseAttn
-_mock_ops_mod.npu_sparse_attn_shared_kv = _mock_fused_fn
-
-sys.modules.setdefault("mindspeed", types.ModuleType("mindspeed"))
-sys.modules.setdefault("mindspeed.ops", types.ModuleType("mindspeed.ops"))
-sys.modules.setdefault("mindspeed.ops.npu_sparse_attn_shared_kv", _mock_ops_mod)
+sfa_mod.SparseAttnSharedKV.apply = _mock_fused_fn
 
 
 class TestSFANPUKernel(unittest.TestCase):
@@ -53,7 +39,7 @@ class TestSFANPUKernel(unittest.TestCase):
         self.sinks = torch.randn(1, 128)
 
     def test_npu_sparse_attention_forward_flow(self):
-        """Test NpuSparseAttention.forward calls npu_sparse_attn_shared_kv correctly."""
+        """Test NpuSparseAttention.forward calls fused attention op correctly."""
         mock_fused_op = _mock_fused_fn
         mock_fused_op.reset_mock()
 

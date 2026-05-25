@@ -16,11 +16,191 @@ from torchtitan_npu.converters.model_custom_interface import (
 )
 from torchtitan_npu.converters.npu_registry import register_model_converter
 from torchtitan_npu.models.deepseek_v4.model import LiCompute, LiLoss, SparseAttention
-
+from torchtitan_npu.ops.aclnn.builder import build_op
 
 logger = logging.getLogger(__name__)
 
-# ---- SFA (SparseAttention) ----
+TORCH_MAX_INT = 9223372036854775807
+
+# Will be compiled lazily, only when converter hits.
+_li_op, _kl_op, _sas_op = None, None, None
+
+
+class SparseAttnSharedKV(torch.autograd.Function):
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def forward(
+        ctx,
+        query,
+        ori_kv,
+        cmp_kv,
+        cu_seq_lens_q,
+        cu_seq_lens_ori_kv,
+        cu_seq_lens_cmp_kv,
+        ori_sparse_indices,
+        cmp_sparse_indices,
+        sinks,
+        softmax_scale,
+        cmp_ratio,
+        ori_mask_mode,
+        cmp_mask_mode,
+        ori_win_left,
+        ori_win_right,
+        num_heads_q,
+        num_heads_kv,
+        head_dim,
+        batch_size,
+        max_seq_len_q,
+        max_seq_len_kv,
+        topk,
+        layout_q,
+        layout_kv,
+    ):
+        ori_kv_stride = ori_kv.stride(0) if ori_kv is not None else 0
+        cmp_kv_stride = cmp_kv.stride(0) if cmp_kv is not None else 0
+        # pyrefly: ignore [missing-attribute]
+        metadata = _sas_op.npu_sparse_attn_sharedkv_metadata(
+            # pyrefly: ignore [missing-attribute]
+            cu_seq_lens_q if cu_seq_lens_q is not None else torch.tensor([]).npu(),
+            # pyrefly: ignore [missing-attribute]
+            torch.tensor([]).npu(),
+            # pyrefly: ignore [missing-attribute]
+            torch.tensor([]).npu(),
+            # pyrefly: ignore [missing-attribute]
+            torch.tensor([]).npu(),
+            # pyrefly: ignore [missing-attribute]
+            torch.tensor([]).npu(),
+            num_heads_q,
+            num_heads_kv,
+            head_dim,
+            batch_size,
+            max_seq_len_q,
+            max_seq_len_kv,
+            0,  # oriTopk
+            topk,
+            cmp_ratio,
+            ori_mask_mode,
+            cmp_mask_mode,
+            ori_win_left,
+            ori_win_right,
+            layout_q,
+            layout_kv,
+            ori_kv is not None,  # hasOriKv
+            cmp_kv is not None,  # hasCmpKv
+        )
+        # pyrefly: ignore [missing-attribute]
+        result, softmax_lse = _sas_op.npu_sparse_attn_sharedkv(
+            query,
+            ori_kv,
+            cmp_kv,
+            ori_sparse_indices,
+            cmp_sparse_indices,
+            None,  # oriBlockTable
+            None,  # cmpBlockTable
+            cu_seq_lens_q,
+            cu_seq_lens_ori_kv,
+            cu_seq_lens_cmp_kv,
+            None,  # sequsedQ
+            None,  # sequsedKv
+            sinks,
+            metadata,
+            softmax_scale,
+            cmp_ratio,
+            ori_mask_mode,
+            cmp_mask_mode,
+            ori_kv_stride,
+            cmp_kv_stride,
+            ori_win_left,
+            ori_win_right,
+            layout_q,
+            layout_kv,
+            True,  # returnSoftmaxLse
+        )
+        ctx.save_for_backward(
+            query,
+            ori_kv,
+            cmp_kv,
+            result,
+            softmax_lse,
+            ori_sparse_indices,
+            cmp_sparse_indices,
+            sinks,
+        )
+        ctx.softmax_scale = softmax_scale
+        ctx.cmp_ratio = cmp_ratio
+        ctx.ori_mask_mode = ori_mask_mode
+        ctx.cmp_mask_mode = cmp_mask_mode
+        ctx.ori_win_left = ori_win_left
+        ctx.ori_win_right = ori_win_right
+        ctx.layout_q = layout_q
+        return result
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def backward(ctx, grad_output):
+        (
+            query,
+            ori_kv,
+            cmp_kv,
+            result,
+            softmax_lse,
+            ori_sparse_indices,
+            cmp_sparse_indices,
+            sinks,
+        ) = ctx.saved_tensors
+        (
+            query_grad,
+            ori_kv_grad,
+            cmp_kv_grad,
+            sinks_grad,
+            # pyrefly: ignore [missing-attribute]
+        ) = _sas_op.npu_sparse_attn_sharedkv_grad(
+            query,
+            ori_kv,
+            cmp_kv,
+            grad_output,
+            result,
+            softmax_lse,
+            ori_sparse_indices,
+            cmp_sparse_indices,
+            None,  # cuSeqlensQ
+            None,  # cuSeqlensOriKv
+            None,  # cuSeqlensCmpKv
+            sinks,
+            ctx.softmax_scale,
+            ctx.cmp_ratio,
+            ctx.ori_mask_mode,
+            ctx.cmp_mask_mode,
+            ctx.ori_win_left,
+            ctx.ori_win_right,
+            ctx.layout_q,
+        )
+        return (
+            query_grad,
+            ori_kv_grad,
+            cmp_kv_grad,
+            None,
+            None,
+            None,
+            None,
+            None,
+            sinks_grad,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def npu_sparse_attn_shared_kv(
@@ -52,8 +232,6 @@ def npu_sparse_attn_shared_kv(
         cmp_sparse_indices = None
     else:
         cmp_sparse_indices = cmp_sparse_indices.unsqueeze(2).contiguous()
-    # pyrefly: ignore [missing-import]
-    from mindspeed.ops.npu_sparse_attn_shared_kv import SparseAttnSharedKV
 
     output = SparseAttnSharedKV.apply(
         query,
@@ -183,9 +361,6 @@ class NpuSparseAttention(SparseAttention):
         return output
 
 
-# ---- LI (LiCompute) ----
-
-
 class NpuLiCompute(LiCompute):
     def __init__(self, parent: LiCompute) -> None:
         # Shallow copy of parent's __dict__ is intentional here:
@@ -207,16 +382,23 @@ class NpuLiCompute(LiCompute):
         q_indexer = q_indexer.to(torch.bfloat16)
         k_indexer = k_indexer.to(torch.bfloat16).unsqueeze(2)
         weights = weights.to(torch.bfloat16)
-        # pyrefly: ignore [missing-import]
-        import mindspeed.ops.npu_lightning_indexer as mindspeed_li
 
-        compress_topk_idxs, index_score = mindspeed_li.npu_lightning_indexer(
+        # pyrefly: ignore [missing-attribute]
+        compress_topk_idxs, index_score = _li_op.npu_lightning_indexer(
             q_indexer,
             k_indexer,
             weights,
-            sparse_count=self.index_topk,
-            sparse_mode=3,
-            cmp_ratio=self.ratio,
+            None,  # actual_seq_q
+            None,  # actual_seq_k
+            None,  # block_table
+            "BSND",  # layout_q
+            "BSND",  # layout_k
+            self.index_topk,
+            3,  # sparse_mode
+            TORCH_MAX_INT,  # pre_tokens
+            TORCH_MAX_INT,  # next_tokens
+            self.ratio,
+            True,  # return_values
         )
 
         compress_topk_idxs = compress_topk_idxs.squeeze(2)
@@ -230,28 +412,6 @@ class NpuLiCompute(LiCompute):
             )
 
         return compress_topk_idxs, index_score
-
-
-# ---- LI Loss (LiLoss) ----
-
-
-ms_npu_sparse_lightning_indexer_grad_kl_loss = None
-
-
-def _get_ms_npu_sparse_lightning_indexer_grad_kl_loss():
-    global ms_npu_sparse_lightning_indexer_grad_kl_loss
-    if ms_npu_sparse_lightning_indexer_grad_kl_loss is None:
-        # pyrefly: ignore [missing-import]
-        from mindspeed.op_builder.npu_sparse_lightning_indexer_grad_kl_loss_builder import (
-            NPUSparseLIGradKlLossOpBuilder,
-        )
-
-        builder = NPUSparseLIGradKlLossOpBuilder()
-        loaded = builder.load()
-        ms_npu_sparse_lightning_indexer_grad_kl_loss = (
-            loaded.npu_sparse_lightning_indexer_grad_kl_loss  # pyrefly: ignore [missing-attribute]
-        )
-    return ms_npu_sparse_lightning_indexer_grad_kl_loss
 
 
 class SparseLightningIndexerGradKLLossWrapper(torch.autograd.Function):
@@ -297,32 +457,33 @@ class SparseLightningIndexerGradKLLossWrapper(torch.autograd.Function):
     # pyrefly: ignore [bad-override]
     def backward(ctx, grad):
         query, key, query_index, key_index, weights, sparse_indices = ctx.saved_tensors
-        softmax_max = softmax_sum = query_rope = key_rope = None
 
         (
             d_query_index,
             d_key_index,
             d_weights,
             loss,
-        ) = _get_ms_npu_sparse_lightning_indexer_grad_kl_loss()(
+            # pyrefly: ignore [missing-attribute]
+        ) = _kl_op.npu_sparse_lightning_indexer_grad_kl_loss(
             query,
             key,
             query_index,
             key_index,
             weights,
             sparse_indices,
-            softmax_max,
-            softmax_sum,
-            query_rope,
-            key_rope,
+            None,  # softmax_max
+            None,  # softmax_sum
+            None,  # query_rope
+            None,  # key_rope
             ctx.actual_seq_qlen,
             ctx.actual_seq_klen,
-            ctx.scale_value,
             ctx.layout,
             ctx.sparse_mode,
             ctx.pre_tokens,
             ctx.next_tokens,
             ctx.cmp_ratio,
+            ctx.scale_value,
+            False,  # deterministic
         )
 
         bsz, slen, *_ = query.shape
@@ -418,18 +579,30 @@ class NpuLiLoss(LiLoss):
 
 class DeepSeekV4SFAConverter(ModelCustomConverter):
     def convert(self, model: nn.Module):
+        global _li_op, _kl_op, _sas_op
+
         for name, module in model.named_modules():
             if isinstance(module, SparseAttention):
+                _sas_op = build_op(
+                    "sparse_attn_sharedkv", ["sparse_attn_sharedkv/binding.cpp"]
+                )
                 replace_module_with_name(model, name, NpuSparseAttention(module))
                 logger.info(
                     "[DeepSeekV4SFAConverter] [SparseAttention forward] Applied."
                 )
 
             if isinstance(module, LiCompute):
+                _li_op = build_op(
+                    "lightning_indexer", ["lightning_indexer/binding.cpp"]
+                )
                 replace_module_with_name(model, name, NpuLiCompute(module))
                 logger.info("[DeepSeekV4SFAConverter] [LiCompute forward] Applied.")
 
             if isinstance(module, LiLoss):
+                _kl_op = build_op(
+                    "sparse_lightning_indexer_grad_kl_loss",
+                    ["sparse_lightning_indexer_grad_kl_loss/binding.cpp"],
+                )
                 replace_module_with_name(model, name, NpuLiLoss(module))
                 logger.info("[DeepSeekV4SFAConverter] [LiLoss forward] Applied.")
 
