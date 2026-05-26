@@ -88,7 +88,11 @@ def _patched_forward_backward_step(
     schedule._loss_fn = _normalized_loss_fn
     try:
         with self.train_context():
-            targets, losses = (labels, []) if self.pp_has_last_stage else (None, None)
+            if self.pp_has_last_stage:
+                targets = labels
+                losses: list[torch.Tensor] | None = []
+            else:
+                targets, losses = None, None
             if self.pp_has_first_stage:
                 schedule.step(
                     inputs,
@@ -112,6 +116,7 @@ def _patched_forward_backward_step(
     # (via _normalized_loss_fn), so summing reconstructs the same value the
     # non-PP path stores as ``loss = loss_sum / global_valid_tokens``.
     if self.pp_has_last_stage:
+        assert losses is not None
         loss = torch.sum(torch.stack(losses)).to(self.device)
     else:
         loss = torch.tensor([-1.0], device=self.device)
