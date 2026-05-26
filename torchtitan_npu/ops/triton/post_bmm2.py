@@ -5,6 +5,7 @@ import torch
 try:
     import triton
     import triton.language as tl
+    import triton.language.extra.cann.extension as tlx
 
     TRITON_AVAILABLE = True
 except ImportError:
@@ -76,25 +77,25 @@ if TRITON_AVAILABLE:
             + k[None, :] * stride_h_k
         ).to(tl.float32)
 
-        h00 = tl.extract_slice(h0, [0, 0], [GROUP, 1], [1, 1])
-        h01 = tl.extract_slice(h0, [0, 1], [GROUP, 1], [1, 1])
-        h02 = tl.extract_slice(h0, [0, 2], [GROUP, 1], [1, 1])
-        h03 = tl.extract_slice(h0, [0, 3], [GROUP, 1], [1, 1])
+        h00 = tlx.extract_slice(h0, [0, 0], [GROUP, 1], [1, 1])
+        h01 = tlx.extract_slice(h0, [0, 1], [GROUP, 1], [1, 1])
+        h02 = tlx.extract_slice(h0, [0, 2], [GROUP, 1], [1, 1])
+        h03 = tlx.extract_slice(h0, [0, 3], [GROUP, 1], [1, 1])
 
-        h10 = tl.extract_slice(h1, [0, 0], [GROUP, 1], [1, 1])
-        h11 = tl.extract_slice(h1, [0, 1], [GROUP, 1], [1, 1])
-        h12 = tl.extract_slice(h1, [0, 2], [GROUP, 1], [1, 1])
-        h13 = tl.extract_slice(h1, [0, 3], [GROUP, 1], [1, 1])
+        h10 = tlx.extract_slice(h1, [0, 0], [GROUP, 1], [1, 1])
+        h11 = tlx.extract_slice(h1, [0, 1], [GROUP, 1], [1, 1])
+        h12 = tlx.extract_slice(h1, [0, 2], [GROUP, 1], [1, 1])
+        h13 = tlx.extract_slice(h1, [0, 3], [GROUP, 1], [1, 1])
 
-        h20 = tl.extract_slice(h2, [0, 0], [GROUP, 1], [1, 1])
-        h21 = tl.extract_slice(h2, [0, 1], [GROUP, 1], [1, 1])
-        h22 = tl.extract_slice(h2, [0, 2], [GROUP, 1], [1, 1])
-        h23 = tl.extract_slice(h2, [0, 3], [GROUP, 1], [1, 1])
+        h20 = tlx.extract_slice(h2, [0, 0], [GROUP, 1], [1, 1])
+        h21 = tlx.extract_slice(h2, [0, 1], [GROUP, 1], [1, 1])
+        h22 = tlx.extract_slice(h2, [0, 2], [GROUP, 1], [1, 1])
+        h23 = tlx.extract_slice(h2, [0, 3], [GROUP, 1], [1, 1])
 
-        h30 = tl.extract_slice(h3, [0, 0], [GROUP, 1], [1, 1])
-        h31 = tl.extract_slice(h3, [0, 1], [GROUP, 1], [1, 1])
-        h32 = tl.extract_slice(h3, [0, 2], [GROUP, 1], [1, 1])
-        h33 = tl.extract_slice(h3, [0, 3], [GROUP, 1], [1, 1])
+        h30 = tlx.extract_slice(h3, [0, 0], [GROUP, 1], [1, 1])
+        h31 = tlx.extract_slice(h3, [0, 1], [GROUP, 1], [1, 1])
+        h32 = tlx.extract_slice(h3, [0, 2], [GROUP, 1], [1, 1])
+        h33 = tlx.extract_slice(h3, [0, 3], [GROUP, 1], [1, 1])
 
         y0 = tl.fma(x0, h00, tl.fma(x1, h01, tl.fma(x2, h02, x3 * h03)))
         y1 = tl.fma(x0, h10, tl.fma(x1, h11, tl.fma(x2, h12, x3 * h13)))
@@ -168,25 +169,25 @@ if TRITON_AVAILABLE:
         # We need H^T coefficients:
         # dx0 uses column 0: [h00, h10, h20, h30]
         # dx1 uses column 1: [h01, h11, h21, h31] ...
-        h00 = tl.extract_slice(h0, [0, 0], [GROUP, 1], [1, 1])
-        h01 = tl.extract_slice(h0, [0, 1], [GROUP, 1], [1, 1])
-        h02 = tl.extract_slice(h0, [0, 2], [GROUP, 1], [1, 1])
-        h03 = tl.extract_slice(h0, [0, 3], [GROUP, 1], [1, 1])
+        h00 = tlx.extract_slice(h0, [0, 0], [GROUP, 1], [1, 1])
+        h01 = tlx.extract_slice(h0, [0, 1], [GROUP, 1], [1, 1])
+        h02 = tlx.extract_slice(h0, [0, 2], [GROUP, 1], [1, 1])
+        h03 = tlx.extract_slice(h0, [0, 3], [GROUP, 1], [1, 1])
 
-        h10 = tl.extract_slice(h1, [0, 0], [GROUP, 1], [1, 1])
-        h11 = tl.extract_slice(h1, [0, 1], [GROUP, 1], [1, 1])
-        h12 = tl.extract_slice(h1, [0, 2], [GROUP, 1], [1, 1])
-        h13 = tl.extract_slice(h1, [0, 3], [GROUP, 1], [1, 1])
+        h10 = tlx.extract_slice(h1, [0, 0], [GROUP, 1], [1, 1])
+        h11 = tlx.extract_slice(h1, [0, 1], [GROUP, 1], [1, 1])
+        h12 = tlx.extract_slice(h1, [0, 2], [GROUP, 1], [1, 1])
+        h13 = tlx.extract_slice(h1, [0, 3], [GROUP, 1], [1, 1])
 
-        h20 = tl.extract_slice(h2, [0, 0], [GROUP, 1], [1, 1])
-        h21 = tl.extract_slice(h2, [0, 1], [GROUP, 1], [1, 1])
-        h22 = tl.extract_slice(h2, [0, 2], [GROUP, 1], [1, 1])
-        h23 = tl.extract_slice(h2, [0, 3], [GROUP, 1], [1, 1])
+        h20 = tlx.extract_slice(h2, [0, 0], [GROUP, 1], [1, 1])
+        h21 = tlx.extract_slice(h2, [0, 1], [GROUP, 1], [1, 1])
+        h22 = tlx.extract_slice(h2, [0, 2], [GROUP, 1], [1, 1])
+        h23 = tlx.extract_slice(h2, [0, 3], [GROUP, 1], [1, 1])
 
-        h30 = tl.extract_slice(h3, [0, 0], [GROUP, 1], [1, 1])
-        h31 = tl.extract_slice(h3, [0, 1], [GROUP, 1], [1, 1])
-        h32 = tl.extract_slice(h3, [0, 2], [GROUP, 1], [1, 1])
-        h33 = tl.extract_slice(h3, [0, 3], [GROUP, 1], [1, 1])
+        h30 = tlx.extract_slice(h3, [0, 0], [GROUP, 1], [1, 1])
+        h31 = tlx.extract_slice(h3, [0, 1], [GROUP, 1], [1, 1])
+        h32 = tlx.extract_slice(h3, [0, 2], [GROUP, 1], [1, 1])
+        h33 = tlx.extract_slice(h3, [0, 3], [GROUP, 1], [1, 1])
 
         dx0 = tl.fma(dy0, h00, tl.fma(dy1, h10, tl.fma(dy2, h20, dy3 * h30)))
         dx1 = tl.fma(dy0, h01, tl.fma(dy1, h11, tl.fma(dy2, h21, dy3 * h31)))

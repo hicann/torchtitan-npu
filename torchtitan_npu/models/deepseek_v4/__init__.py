@@ -62,8 +62,6 @@ def _make_smoke_moe_args() -> MoEArgs:
         num_experts=8,
         num_shared_experts=1,
         top_k=2,
-        num_expert_groups=2,
-        num_limited_groups=2,
         score_func="sqrtsoftplus",
         route_norm=True,
         score_before_experts=False,

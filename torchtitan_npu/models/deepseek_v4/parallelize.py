@@ -845,9 +845,7 @@ def _compile_moe_transformer_block(
             )
         if attr_name in {"cal_index_loss", "hc_pre"}:
             continue
-        if isinstance(submod, moe_module.MoE):
-            _compile_children_except(submod, {"experts"}, compile_config)
-        elif isinstance(submod, Attention):
+        if isinstance(submod, Attention):
             _compile_children_except(submod, {"inner_attention"}, compile_config)
         else:
             setattr(

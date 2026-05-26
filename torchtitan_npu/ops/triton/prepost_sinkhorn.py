@@ -6,6 +6,7 @@ import torch.nn.functional as F
 try:
     import triton
     import triton.language as tl
+    import triton.language.extra.cann.extension as tlx
 
     TRITON_AVAILABLE = True
 except ImportError:
@@ -353,7 +354,7 @@ if TRITON_AVAILABLE:
             (sinkhorn_iters - 1, group, hc_mult, 1), 0.0, dtype=tl.float32
         )
 
-        col_sum_list = tl.insert_slice(
+        col_sum_list = tlx.insert_slice(
             col_sum_list,
             col0[None, :, :, :],
             offsets=[0, 0, 0, 0],
@@ -368,14 +369,14 @@ if TRITON_AVAILABLE:
             colk = tl.sum(Cmat, axis=1, keep_dims=True)
             Bmat = Cmat / (colk + eps)
 
-            row_sum_list = tl.insert_slice(
+            row_sum_list = tlx.insert_slice(
                 row_sum_list,
                 rowk[None, :, :, :],
                 offsets=[k, 0, 0, 0],
                 sizes=[1, group, hc_mult, 1],
                 strides=[1, 1, 1, 1],
             )
-            col_sum_list = tl.insert_slice(
+            col_sum_list = tlx.insert_slice(
                 col_sum_list,
                 colk[None, :, :, :],
                 offsets=[k + 1, 0, 0, 0],
@@ -396,14 +397,14 @@ if TRITON_AVAILABLE:
         for j in tl.static_range(0, sinkhorn_iters - 1):
             k = (sinkhorn_iters - 2) - j
 
-            colk = tl.extract_slice(
+            colk = tlx.extract_slice(
                 col_sum_list,
                 offsets=[k + 1, 0, 0, 0],
                 sizes=[1, group, 1, BLOCK_ALIGN],
                 strides=[1, 1, 1, 1],
             ).reshape(group, 1, BLOCK_ALIGN)
 
-            rowk = tl.extract_slice(
+            rowk = tlx.extract_slice(
                 row_sum_list,
                 offsets=[k, 0, 0, 0],
                 sizes=[1, group, hc_mult, 1],
@@ -429,7 +430,7 @@ if TRITON_AVAILABLE:
             dB = tl.where(col_mask, dB_prev, 0.0)
             B_cur = tl.where(col_mask, B_prev, 0.0)
 
-        col0_saved = tl.extract_slice(
+        col0_saved = tlx.extract_slice(
             col_sum_list,
             offsets=[0, 0, 0, 0],
             sizes=[1, group, 1, BLOCK_ALIGN],
