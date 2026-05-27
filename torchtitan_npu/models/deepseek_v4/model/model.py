@@ -9,6 +9,7 @@ import math
 
 import scipy
 import torch
+import torch.distributed._functional_collectives as ft_c
 import torch.nn.functional as F
 from torch import nn
 from torchtitan.protocols.model import AttentionMasksType
@@ -1009,6 +1010,12 @@ class HcHead(torch.nn.Module):
         return y.to(dtype)
 
 
+def _wait_async_collective_tensor(value):
+    if isinstance(value, ft_c.AsyncCollectiveTensor):
+        return value.wait()
+    return value
+
+
 class MTPModule(DeepSeekV4TransformerBlock):
     """
     MTP block with linear projection and transformerblock layers.
@@ -1190,6 +1197,16 @@ class DeepSeekV4Model(ModelProtocol):
                 token_end_idx = token_offset_id + seq_len
                 token_offset = tokens[:, token_offset_id:token_end_idx]
                 input_offset = self.tok_embeddings(token_offset)
+                # With TP RowwiseParallel, tok_embeddings may return an
+                # AsyncCollectiveTensor. The main path materializes that value
+                # through unsqueeze/repeat before it enters compiled blocks, but
+                # MTP sends the offset embedding directly into compiled enorm.
+                # Waiting here keeps AOTAutograd from recording an
+                # AsyncCollectiveTensor in forward metadata while backward later
+                # receives a plain Tensor tangent.
+                # Related upstream PyTorch fix:
+                # https://github.com/pytorch/pytorch/pull/179849
+                input_offset = _wait_async_collective_tensor(input_offset)
                 layer_id = mtp_layer_id + self.model_args.n_layers
                 h = self.layers[str(layer_id)](
                     input_offset,
