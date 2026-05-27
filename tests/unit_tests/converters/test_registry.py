@@ -3,7 +3,21 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from contextlib import contextmanager
+
 from torchtitan_npu.converters.npu_registry import registry
+
+
+@contextmanager
+def isolated_registry():
+    test_registry = registry()
+    old_model_configs = dict(test_registry._model_configs)
+    old_converter_classes = dict(test_registry._converter_classes)
+    try:
+        yield test_registry
+    finally:
+        test_registry._model_configs = old_model_configs
+        test_registry._converter_classes = old_converter_classes
 
 
 class DummyModelCustomConfig:
@@ -12,21 +26,20 @@ class DummyModelCustomConfig:
 
 def _run_register_case(register_name):
     calls = []
-    test_registry = registry()
+    with isolated_registry() as test_registry:
+        original_register = test_registry._register_as_model_converter
 
-    original_register = test_registry._register_as_model_converter
+        def mock_register(name, config):
+            calls.append((name, config))
 
-    def mock_register(name, config):
-        calls.append((name, config))
+        test_registry._register_as_model_converter = mock_register
 
-    test_registry._register_as_model_converter = mock_register
+        decorated_config = test_registry.register(register_name)(DummyModelCustomConfig)
+        config = test_registry.get(register_name)
 
-    decorated_config = test_registry.register(register_name)(DummyModelCustomConfig)
-    config = test_registry.get(register_name)
+        test_registry._register_as_model_converter = original_register
 
-    test_registry._register_as_model_converter = original_register
-
-    return decorated_config, config, calls
+        return decorated_config, config, calls
 
 
 def test_registry_is_singleton():
@@ -48,13 +61,28 @@ def test_register_sets_name_and_stores_config():
 
 
 def test_get_returns_none_for_unknown_config():
-    assert registry.get("definitely_missing_config") is None
+    assert registry().get("definitely_missing_config") is None
 
 
 def test_core_converter_registrations_exist():
-    expected_names = ["npu_dsa", "npu_rms_norm", "npu_rope", "npu_permute"]
+    import importlib
 
-    for name in expected_names:
-        config = registry.get(name)
+    for module_name in (
+        "torchtitan_npu.converters.kernels.dsa",
+        "torchtitan_npu.converters.kernels.rms_norm",
+        "torchtitan_npu.converters.kernels.rope",
+        "torchtitan_npu.converters.kernels.permute",
+    ):
+        module = importlib.import_module(module_name)
+        importlib.reload(module)
+
+    expected_model_converter_names = [
+        "npu_dsa",
+        "npu_rms_norm",
+        "npu_rope",
+        "npu_permute",
+    ]
+    for name in expected_model_converter_names:
+        config = registry().get(name)
         assert config is not None, f"{name} should be registered"
         assert config.name == name

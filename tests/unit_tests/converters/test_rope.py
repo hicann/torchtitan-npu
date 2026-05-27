@@ -3,102 +3,124 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from torchtitan_npu.converters.kernels.rope import (
-    npu_apply_rotary_emb_deepseek,
-    npu_apply_rotary_emb_deepseek_v4,
-    npu_apply_rotary_emb_llama,
-    npu_apply_rotary_emb_qwen,
+    _ROPE_REPLACEMENTS,
+    npu_apply_rotary_emb_complex,
+    npu_apply_rotary_emb_cos_sin,
+    npu_apply_rotary_emb_single_complex,
     NpuRoPEConverter,
-    RoPEKernel,
 )
 
 
-def test_model_impl_mapping():
-    assert NpuRoPEConverter.MODEL_IMPL["deepseek_v3"] == npu_apply_rotary_emb_deepseek
-    assert NpuRoPEConverter.MODEL_IMPL["deepseek_v32"] == npu_apply_rotary_emb_deepseek
-    assert (
-        NpuRoPEConverter.MODEL_IMPL["deepseek_v4"] == npu_apply_rotary_emb_deepseek_v4
-    )
-    assert NpuRoPEConverter.MODEL_IMPL["qwen3"] == npu_apply_rotary_emb_qwen
-    assert NpuRoPEConverter.MODEL_IMPL["_default"] == npu_apply_rotary_emb_llama
-
-    module_path, func_name, impl = RoPEKernel.get_impl_cls("deepseek_v3")
-
-    assert module_path == "torchtitan.models.common.rope"
-    assert func_name == "apply_rotary_emb_single_complex"
-    assert impl is npu_apply_rotary_emb_deepseek
+def test_rope_replacement_mapping_tracks_current_upstream_api():
+    assert _ROPE_REPLACEMENTS == {
+        "apply_rotary_emb_complex": npu_apply_rotary_emb_complex,
+        "apply_rotary_emb_single_complex": npu_apply_rotary_emb_single_complex,
+        "apply_rotary_emb_cos_sin": npu_apply_rotary_emb_cos_sin,
+    }
 
 
-def test_deepseek_v3_impl_selection():
-    mock_job_config = MagicMock()
-    mock_job_config.model.name = "deepseek_v3"
+@pytest.mark.parametrize(
+    "func_name,impl", list(_ROPE_REPLACEMENTS.items()), ids=list(_ROPE_REPLACEMENTS)
+)
+def test_replace_one_invokes_replace_functions_for_each_entry(func_name, impl):
+    fake_model = MagicMock()
+    fake_model.__class__.__module__ = "torchtitan.models.llama3.model"
 
-    converter = NpuRoPEConverter(mock_job_config, None)
-    impl = converter._get_impl_cls()
+    with patch(
+        "torchtitan_npu.converters.kernels.rope.replace_functions",
+        return_value=0,
+    ) as mock_replace:
+        NpuRoPEConverter._replace_one(func_name, impl, fake_model)
 
-    assert impl == npu_apply_rotary_emb_deepseek
-
-    # NOTE: "deepseek_v3" key matches "deepseek_v32" first due to substring
-    # matching; v32-specific entry is currently unreachable. This is a known
-    # issue to be fixed separately.
-    module_path, func_name, impl = RoPEKernel.get_impl_cls("deepseek_v32")
-
-    assert impl is npu_apply_rotary_emb_deepseek
-
-
-def test_deepseek_v32_impl_selection():
-    mock_job_config = MagicMock()
-    mock_job_config.model.name = "deepseek_v32"
-
-    converter = NpuRoPEConverter(mock_job_config, None)
-    impl = converter._get_impl_cls()
-
-    assert impl == npu_apply_rotary_emb_deepseek
-
-    module_path, func_name, impl = RoPEKernel.get_impl_cls("qwen3")
-
-    assert module_path == "torchtitan.models.common.rope"
-    assert func_name == "apply_rotary_emb_cos_sin"
-    assert impl is npu_apply_rotary_emb_qwen
+    assert mock_replace.call_count >= 1
+    for call in mock_replace.call_args_list:
+        assert call.args[0] == func_name
+        assert call.args[1] is impl
 
 
-def test_deepseek_v4_impl_selection():
-    mock_job_config = MagicMock()
-    mock_job_config.model.name = "deepseek_v4"
+def test_convert_iterates_all_replacements():
+    converter = NpuRoPEConverter(model_spec=MagicMock())
+    fake_model = MagicMock()
 
-    converter = NpuRoPEConverter(mock_job_config, None)
-    impl = converter._get_impl_cls()
+    with patch.object(NpuRoPEConverter, "_replace_one") as mock_replace_one:
+        converter.convert(fake_model)
 
-    assert impl == npu_apply_rotary_emb_deepseek_v4
-
-
-def test_qwen3_impl_selection():
-    mock_job_config = MagicMock()
-    mock_job_config.model.name = "qwen3"
-
-    converter = NpuRoPEConverter(mock_job_config, None)
-    impl = converter._get_impl_cls()
-
-    assert impl == npu_apply_rotary_emb_qwen
-
-
-def test_llama_impl_selection():
-    mock_job_config = MagicMock()
-    mock_job_config.model.name = "llama3"
-
-    converter = NpuRoPEConverter(mock_job_config, None)
-    impl = converter._get_impl_cls()
-
-    assert impl == npu_apply_rotary_emb_llama
+    assert mock_replace_one.call_count == len(_ROPE_REPLACEMENTS)
+    called_pairs = {
+        (call.args[0], call.args[1].__name__)
+        for call in mock_replace_one.call_args_list
+    }
+    expected_pairs = {
+        (name, impl.__name__) for name, impl in _ROPE_REPLACEMENTS.items()
+    }
+    assert called_pairs == expected_pairs
+    for call in mock_replace_one.call_args_list:
+        assert call.args[2] is fake_model
 
 
-def test_unknown_model_fallback():
-    mock_job_config = MagicMock()
-    mock_job_config.model.name = "unknown_model"
+def test_replace_one_walks_three_packages_for_npu_model():
+    """
+    torchtitan_npu.* model → walk three locations:
+    (1) the model's own module tree,
+    (2) the upstream-rewritten package (torchtitan_npu→torchtitan),
+    (3) the shared torchtitan.models.common package.
+    """
+    fake_model = MagicMock()
+    fake_model.__class__.__module__ = "torchtitan_npu.models.deepseek_v4.model"
 
-    converter = NpuRoPEConverter(mock_job_config, None)
-    impl = converter._get_impl_cls()
+    with patch(
+        "torchtitan_npu.converters.kernels.rope.replace_functions",
+        return_value=0,
+    ) as mock_replace:
+        NpuRoPEConverter._replace_one(
+            "apply_rotary_emb_complex", npu_apply_rotary_emb_complex, fake_model
+        )
 
-    assert impl == npu_apply_rotary_emb_llama
+    assert mock_replace.call_count == 3
+    assert mock_replace.call_args_list[0].kwargs == {"model": fake_model}
+    assert mock_replace.call_args_list[1].kwargs == {
+        "package": "torchtitan.models.deepseek_v4.model"
+    }
+    assert mock_replace.call_args_list[2].kwargs == {
+        "package": "torchtitan.models.common"
+    }
+
+
+def test_replace_one_walks_two_packages_when_model_is_already_upstream():
+    fake_model = MagicMock()
+    fake_model.__class__.__module__ = "torchtitan.models.llama3.model"
+
+    with patch(
+        "torchtitan_npu.converters.kernels.rope.replace_functions",
+        return_value=0,
+    ) as mock_replace:
+        NpuRoPEConverter._replace_one(
+            "apply_rotary_emb_complex", npu_apply_rotary_emb_complex, fake_model
+        )
+
+    assert mock_replace.call_count == 2
+    assert mock_replace.call_args_list[0].kwargs == {"model": fake_model}
+    assert mock_replace.call_args_list[1].kwargs == {
+        "package": "torchtitan.models.common"
+    }
+
+
+def test_replace_one_walks_only_model_when_already_in_common_pkg():
+    fake_model = MagicMock()
+    fake_model.__class__.__module__ = "torchtitan.models.common.rope"
+
+    with patch(
+        "torchtitan_npu.converters.kernels.rope.replace_functions",
+        return_value=0,
+    ) as mock_replace:
+        NpuRoPEConverter._replace_one(
+            "apply_rotary_emb_complex", npu_apply_rotary_emb_complex, fake_model
+        )
+
+    assert mock_replace.call_count == 1
+    assert mock_replace.call_args_list[0].kwargs == {"model": fake_model}

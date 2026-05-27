@@ -7,6 +7,7 @@ set -e
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
+pip install -r requirements.txt
 pip install -r requirements_dev.txt
 
 # Global variable
@@ -23,7 +24,6 @@ TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-300}
 # Run torchtitan upstream unit tests (with NPU patches applied)
 run_upstream_ut() {
     echo "Running torchtitan upstream unit tests..."
-
 
     # Ensure torchtitan_npu is installed (applies patches on import)
     if ! python3 -c "import torchtitan_npu" 2>/dev/null; then
@@ -67,6 +67,7 @@ EOF
     pytest_args="$pytest_args --ignore=tests/unit_tests/test_tokenizer.py"
     pytest_args="$pytest_args --ignore=tests/unit_tests/test_activation_checkpoint.py"
     pytest_args="$pytest_args --ignore=tests/unit_tests/test_download_hf_assets.py"
+    pytest_args="$pytest_args --ignore=tests/unit_tests/test_fsdp_moe_sharding.py"
 
     # Test target: torchtitan upstream unit tests
     local test_target="tests/unit_tests/"
@@ -98,9 +99,6 @@ EOF
     fi
 }
 
-
-
-# [TODO] CI tests  temporarily delete it
-
-# run_upstream_ut
-# pytest -v --tb=short tests/unit_tests
+run_upstream_ut
+cd "$PROJECT_ROOT"
+PYTHONPATH="${TITAN_DIR}:${PROJECT_ROOT}:${PYTHONPATH}" python3 -m pytest -v --tb=short tests/unit_tests

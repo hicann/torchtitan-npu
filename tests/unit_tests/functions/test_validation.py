@@ -2,8 +2,6 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-from types import SimpleNamespace
-
 import pytest
 
 import torch.nn as nn
@@ -46,8 +44,11 @@ def test_module_filter_fn_rejects_filtered_fqn():
 
 
 def test_npu_converter_convert_raises_for_unsupported_model():
-    job_config = SimpleNamespace(model=SimpleNamespace(name="llama3"))
-    converter = RejectingConverter(job_config, parallel_dims=object())
+    converter = RejectingConverter(
+        RejectingConverter.Config(),
+        parallel_dims=object(),
+        model_compile_enabled=False,
+    )
 
     with pytest.raises(ValueError, match="NOT compatible"):
         converter.convert(nn.Linear(8, 16))

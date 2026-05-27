@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from contextlib import contextmanager
 from unittest.mock import Mock, patch
 
 import torch.nn as nn
@@ -26,6 +27,20 @@ from torchtitan_npu.converters.model_custom_interface import (
     StateDictUpdater,
 )
 from torchtitan_npu.converters.npu_registry import registry
+
+
+@contextmanager
+def isolated_model_config_registry():
+    test_registry = registry()
+    old_model_configs = dict(test_registry._model_configs)
+    old_converter_classes = dict(test_registry._converter_classes)
+    test_registry._model_configs = {}
+    test_registry._converter_classes = {}
+    try:
+        yield test_registry
+    finally:
+        test_registry._model_configs = old_model_configs
+        test_registry._converter_classes = old_converter_classes
 
 
 class TestApplyParallelizePlanUpdater:
@@ -145,55 +160,40 @@ class TestApplyStateDictUpdateIntegration:
 class TestRegisterModelConverter:
     @classmethod
     def test_register_model_converter_adds_to_model_configs(cls):
-        test_registry = registry()
-        test_registry._model_configs = {}
+        with isolated_model_config_registry() as test_registry:
 
-        @test_registry.register("test_model_config")
-        class TestModelConfig(ModelCustomConfig):
-            pass
+            @test_registry.register("test_model_config")
+            class TestModelConfig(ModelCustomConfig):
+                pass
 
-        assert "test_model_config" in test_registry._model_configs
-        assert test_registry._model_configs["test_model_config"] is TestModelConfig
-        assert test_registry.get("test_model_config") is TestModelConfig
+            assert "test_model_config" in test_registry._model_configs
+            assert test_registry._model_configs["test_model_config"] is TestModelConfig
+            assert test_registry.get("test_model_config") is TestModelConfig
 
     @classmethod
     def test_set_name(cls):
-        test_registry = registry()
-        test_registry._model_configs = {}
+        with isolated_model_config_registry():
 
-        @test_registry.register("custom_model_name")
-        class CustomModelConfig(ModelCustomConfig):
-            pass
+            @registry().register("custom_model_name")
+            class CustomModelConfig(ModelCustomConfig):
+                pass
 
-        assert CustomModelConfig.name == "custom_model_name"
+            assert CustomModelConfig.name == "custom_model_name"
 
     @classmethod
     def test_create_converter_class(cls):
-        test_registry = registry()
-        test_registry._model_configs = {}
-
-        registered_converter_classes = []
-
-        def mock_register_model_converter(converter_cls, name):
-            registered_converter_classes.append((name, converter_cls))
-
-        with patch(
-            "torchtitan.protocols.model_converter.register_model_converter",
-            side_effect=mock_register_model_converter,
-        ):
+        with isolated_model_config_registry() as test_registry:
 
             @test_registry.register("test_converter_creation")
             class TestConfig(ModelCustomConfig):
                 pass
 
-        assert len(registered_converter_classes) == 1
-        registered_name, registered_cls = registered_converter_classes[0]
-        assert registered_name == "test_converter_creation"
+            registered_cls = test_registry._converter_classes["test_converter_creation"]
 
-        assert issubclass(registered_cls, ModelCustomConfigConverter)
-
-        assert hasattr(registered_cls, "_model_config")
-        assert registered_cls._model_config is TestConfig
+            assert issubclass(registered_cls, ModelCustomConfigConverter)
+            assert hasattr(registered_cls, "_model_config")
+            assert registered_cls._model_config is TestConfig
+            assert registered_cls.Config._owner is registered_cls
 
     @classmethod
     def test_multiple_updaters_in_order(cls):

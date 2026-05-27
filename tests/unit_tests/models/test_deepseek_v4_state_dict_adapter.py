@@ -36,9 +36,6 @@ def _load_dsv4_adapter_class():
     if module_name in sys.modules:
         return sys.modules[module_name].DeepSeekV4StateDictAdapter
 
-    fake_torch_npu = types.ModuleType("torch_npu")
-    sys.modules.setdefault("torch_npu", fake_torch_npu)
-
     repo_root = Path(__file__).resolve().parents[3]
     npu_root = repo_root / "torchtitan_npu"
     _ensure_package_stub("torchtitan_npu", npu_root)

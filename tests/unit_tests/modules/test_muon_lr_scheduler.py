@@ -10,7 +10,6 @@ from torchtitan.components.lr_scheduler import LRSchedulersContainer
 
 from torchtitan_npu.patches.optimizer.muon_optimizer import (
     build_muon_hybrid_optimizers,
-    build_muon_lr_schedulers,
     MuonLRSchedulersContainer,
 )
 
@@ -21,10 +20,15 @@ def test_creates_two_independent_schedulers(muon_optimizer_config, lr_scheduler_
     opt_config = muon_optimizer_config(muon_adjust_lr_fn="original").to_namespace()
     optimizers = build_muon_hybrid_optimizers([model], opt_config, None)
 
-    lr_config = lr_scheduler_config().to_namespace()
+    lr_config = lr_scheduler_config()
     training_steps = 10
 
-    schedulers = build_muon_lr_schedulers(optimizers, lr_config, training_steps)
+    schedulers = MuonLRSchedulersContainer.Config(
+        warmup_steps=lr_config.warmup_steps,
+        decay_ratio=lr_config.decay_ratio,
+        decay_type=lr_config.decay_type,
+        min_lr_factor=lr_config.min_lr_factor,
+    ).build(optimizers=optimizers, training_steps=training_steps)
 
     assert isinstance(schedulers, MuonLRSchedulersContainer)
     assert len(schedulers.schedulers) == 2
@@ -112,10 +116,7 @@ def test_checkpoint_preserves_independent_base_lr(
     muon_optimizer_config, lr_scheduler_config
 ):
     """
-    Core test: Verify checkpoint save/load preserves independent base_lr.
-
-    This tests the fix for the original issue where AdamW's lr was
-    incorrectly replaced by Muon's lr after checkpoint load.
+    Verify checkpoint save/load preserves independent base_lr.
     """
     model = nn.Linear(8, 8)
     opt_config = muon_optimizer_config(
@@ -125,10 +126,15 @@ def test_checkpoint_preserves_independent_base_lr(
     ).to_namespace()
     optimizers = build_muon_hybrid_optimizers([model], opt_config, None)
 
-    lr_config = lr_scheduler_config(warmup_steps=2, decay_ratio=0.8).to_namespace()
+    lr_config = lr_scheduler_config(warmup_steps=2, decay_ratio=0.8)
     training_steps = 10
 
-    schedulers = build_muon_lr_schedulers(optimizers, lr_config, training_steps)
+    schedulers = MuonLRSchedulersContainer.Config(
+        warmup_steps=lr_config.warmup_steps,
+        decay_ratio=lr_config.decay_ratio,
+        decay_type=lr_config.decay_type,
+        min_lr_factor=lr_config.min_lr_factor,
+    ).build(optimizers=optimizers, training_steps=training_steps)
 
     muon_scheduler = schedulers.schedulers[0]
     adamw_scheduler = schedulers.schedulers[1]
@@ -151,7 +157,12 @@ def test_checkpoint_preserves_independent_base_lr(
         muon_adjust_lr_fn="original",
     ).to_namespace()
     optimizers2 = build_muon_hybrid_optimizers([model2], opt_config2, None)
-    schedulers2 = build_muon_lr_schedulers(optimizers2, lr_config, training_steps)
+    schedulers2 = MuonLRSchedulersContainer.Config(
+        warmup_steps=lr_config.warmup_steps,
+        decay_ratio=lr_config.decay_ratio,
+        decay_type=lr_config.decay_type,
+        min_lr_factor=lr_config.min_lr_factor,
+    ).build(optimizers=optimizers2, training_steps=training_steps)
 
     schedulers2.load_state_dict(saved_state)
 
@@ -183,10 +194,15 @@ def test_match_rms_adamw_uses_standard_scheduler(
     ).to_namespace()
     optimizers = build_muon_hybrid_optimizers([model], opt_config, None)
 
-    lr_config = lr_scheduler_config().to_namespace()
+    lr_config = lr_scheduler_config()
     training_steps = 10
 
-    schedulers = build_muon_lr_schedulers(optimizers, lr_config, training_steps)
+    schedulers = MuonLRSchedulersContainer.Config(
+        warmup_steps=lr_config.warmup_steps,
+        decay_ratio=lr_config.decay_ratio,
+        decay_type=lr_config.decay_type,
+        min_lr_factor=lr_config.min_lr_factor,
+    ).build(optimizers=optimizers, training_steps=training_steps)
 
     assert isinstance(
         schedulers, LRSchedulersContainer

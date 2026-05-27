@@ -12,14 +12,16 @@ from torchtitan_npu.converters.npu_converter import NPUConverter
 
 
 def test_converter_init(mock_job_config, mock_parallel_dims):
-    config = mock_job_config(model_name="llama3")
-    converter = NPUConverter(config, mock_parallel_dims)
-    assert converter.model_name == "llama3"
-    assert converter.job_config == config
+    config = NPUConverter.Config()
+    converter = NPUConverter(
+        config, parallel_dims=mock_parallel_dims, model_compile_enabled=False
+    )
+    assert converter.parallel_dims is mock_parallel_dims
+    assert converter.model_compile_enabled is False
 
 
 def test_convert_calls_patch_apply(mock_job_config, mock_parallel_dims, simple_model):
-    config = mock_job_config(model_name="llama3")
+    config = NPUConverter.Config()
 
     mock_patch_cls = MagicMock(spec=BaseConverter)
     mock_patch_cls.apply.return_value = 5
@@ -29,14 +31,16 @@ def test_convert_calls_patch_apply(mock_job_config, mock_parallel_dims, simple_m
     with patch.object(NPUConverter, "_patch_cls", mock_patch_cls), patch.object(
         NPUConverter, "_patch_name", "test_patch"
     ), patch.object(NPUConverter, "_supported_models", {"*"}):
-        converter = NPUConverter(config, mock_parallel_dims)
+        converter = NPUConverter(
+            config, parallel_dims=mock_parallel_dims, model_compile_enabled=False
+        )
         converter.convert(simple_model)
 
-    mock_patch_cls.apply.assert_called_once_with(simple_model, "llama3")
+    mock_patch_cls.apply.assert_called_once_with(simple_model, "unknown")
 
 
 def test_convert_returns_model(mock_job_config, mock_parallel_dims, simple_model):
-    config = mock_job_config(model_name="llama3")
+    config = NPUConverter.Config()
 
     mock_patch_cls = MagicMock(spec=BaseConverter)
     mock_patch_cls.apply.return_value = 0
@@ -45,7 +49,9 @@ def test_convert_returns_model(mock_job_config, mock_parallel_dims, simple_model
     with patch.object(NPUConverter, "_patch_cls", mock_patch_cls), patch.object(
         NPUConverter, "_patch_name", "test_patch"
     ), patch.object(NPUConverter, "_supported_models", {"*"}):
-        converter = NPUConverter(config, mock_parallel_dims)
+        converter = NPUConverter(
+            config, parallel_dims=mock_parallel_dims, model_compile_enabled=False
+        )
         result = converter.convert(simple_model)
 
     assert result is simple_model
@@ -54,7 +60,7 @@ def test_convert_returns_model(mock_job_config, mock_parallel_dims, simple_model
 def test_convert_raises_for_incompatible_model(
     mock_job_config, mock_parallel_dims, simple_model
 ):
-    config = mock_job_config(model_name="llama3")
+    config = NPUConverter.Config()
 
     mock_patch_cls = MagicMock(spec=BaseConverter)
     mock_patch_cls.is_compatible.return_value = False
@@ -62,13 +68,15 @@ def test_convert_raises_for_incompatible_model(
     with patch.object(NPUConverter, "_patch_cls", mock_patch_cls), patch.object(
         NPUConverter, "_patch_name", "test_patch"
     ), patch.object(NPUConverter, "_supported_models", {"deepseek_v3"}):
-        converter = NPUConverter(config, mock_parallel_dims)
+        converter = NPUConverter(
+            config, parallel_dims=mock_parallel_dims, model_compile_enabled=False
+        )
         with pytest.raises(ValueError, match="NOT compatible"):
             converter.convert(simple_model)
 
 
 def test_convert_wraps_patch_failure(mock_job_config, mock_parallel_dims, simple_model):
-    config = mock_job_config(model_name="llama3")
+    config = NPUConverter.Config()
 
     mock_patch_cls = MagicMock(spec=BaseConverter)
     mock_patch_cls.is_compatible.return_value = True
@@ -77,6 +85,8 @@ def test_convert_wraps_patch_failure(mock_job_config, mock_parallel_dims, simple
     with patch.object(NPUConverter, "_patch_cls", mock_patch_cls), patch.object(
         NPUConverter, "_patch_name", "test_patch"
     ), patch.object(NPUConverter, "_supported_models", {"*"}):
-        converter = NPUConverter(config, mock_parallel_dims)
+        converter = NPUConverter(
+            config, parallel_dims=mock_parallel_dims, model_compile_enabled=False
+        )
         with pytest.raises(RuntimeError, match="Failed to apply patch"):
             converter.convert(simple_model)

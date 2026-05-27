@@ -2,7 +2,10 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+import pytest
 import torch
+import torch.nn as nn
+from torchtitan.components.optimizer import OptimizersContainer
 
 from torchtitan_npu.patches.optimizer import swap_optimizer
 
@@ -15,65 +18,63 @@ def test_unwrap_dtensor_returns_plain_tensor_for_non_dtensor():
     assert result is tensor
 
 
-def test_swap_optimizer_patch_step_function_updates_adam_classes(monkeypatch):
-    orig_adam_step = torch.optim.Adam.step
-    orig_adamw_step = torch.optim.AdamW.step
-    try:
-        monkeypatch.setattr(torch.optim.Adam, "step", lambda self, closure=None: None)
-        monkeypatch.setattr(
-            torch.optim.AdamW,
-            "step",
-            lambda self, closure=None: None,
-        )
+def test_swap_config_delegates_to_base_container_when_disabled():
+    """swap_optimizer=False → Config.build() returns a plain OptimizersContainer."""
+    model = nn.Linear(2, 2)
+    config = swap_optimizer.SwapOptimizersContainer.Config(
+        swap_optimizer=False, name="AdamW", lr=1e-3, implementation="for-loop"
+    )
 
-        swap_optimizer.patch_optimizer_step()
+    result = config.build(model_parts=[model])
 
-        assert torch.optim.Adam.step is swap_optimizer.swap_optimizer_step
-        assert torch.optim.AdamW.step is swap_optimizer.swap_optimizer_step
-    finally:
-        monkeypatch.setattr(torch.optim.Adam, "step", orig_adam_step)
-        monkeypatch.setattr(torch.optim.AdamW, "step", orig_adamw_step)
+    assert isinstance(result, OptimizersContainer)
+    assert not isinstance(result, swap_optimizer.SwapOptimizersContainer)
 
 
-def test_swap_optimizer_config_build_rejects_unknown_optimizer():
-    optimizer_config = swap_optimizer.SwapOptimizersContainer.Config(
+def test_swap_config_rejects_unknown_optimizer():
+    """Unknown optimizer name raises NotImplementedError before any NPU access."""
+    config = swap_optimizer.SwapOptimizersContainer.Config(
         swap_optimizer=True,
         name="SGD",
         lr=1e-3,
-        beta1=0.9,
-        beta2=0.95,
-        eps=1e-8,
-        weight_decay=0.1,
-        implementation="fused",
+        implementation="for-loop",
         swap_optimizer_times=8,
     )
 
-    try:
-        optimizer_config.build(model_parts=[])
-        raise AssertionError("Expected NotImplementedError for unsupported optimizer")
-    except NotImplementedError as exc:
-        assert "Optimizer SGD not added" in str(exc)
+    with pytest.raises(NotImplementedError, match="Optimizer SGD not added"):
+        config.build(model_parts=[nn.Linear(2, 2)])
 
 
-def test_swap_optimizer_config_build_uses_swap_container(monkeypatch):
-    monkeypatch.setattr(torch.optim.AdamW, "step", lambda self, closure=None: None)
-    monkeypatch.setattr(torch.optim.Adam, "step", lambda self, closure=None: None)
+def test_swap_config_routes_to_swap_container_when_enabled(monkeypatch):
+    """swap_optimizer=True → Config.build() instantiates the _owner class.
 
-    model = torch.nn.Linear(4, 4)
-    optimizer_config = swap_optimizer.SwapOptimizersContainer.Config(
+    Mocks _owner so the test verifies dispatch routing without running the
+    real SwapOptimizersContainer.__init__ (which touches NPU streams).
+    """
+    instantiated = []
+
+    class FakeOwner:
+        def __init__(self, *, config, model_parts):
+            instantiated.append((config, model_parts))
+
+    monkeypatch.setattr(
+        swap_optimizer.SwapOptimizersContainer.Config, "_owner", FakeOwner
+    )
+
+    config = swap_optimizer.SwapOptimizersContainer.Config(
         swap_optimizer=True,
         name="AdamW",
         lr=1e-3,
-        beta1=0.9,
-        beta2=0.95,
-        eps=1e-8,
-        weight_decay=0.1,
         implementation="fused",
         swap_optimizer_times=16,
     )
 
-    container = optimizer_config.build(model_parts=[model])
+    result = config.build(model_parts=["model_part"])
 
-    assert isinstance(container, swap_optimizer.SwapOptimizersContainer)
-    assert len(container.optimizers) == 1
-    assert container.optimizers[0].step.__func__ is swap_optimizer.swap_optimizer_step
+    assert isinstance(result, FakeOwner)
+    assert len(instantiated) == 1
+    cfg, parts = instantiated[0]
+    assert cfg.swap_optimizer is True
+    assert cfg.swap_optimizer_times == 16
+    assert cfg.name == "AdamW"
+    assert parts == ["model_part"]

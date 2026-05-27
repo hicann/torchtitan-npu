@@ -3,12 +3,13 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 from torch.distributed._tensor import DTensor, Partial, Replicate
-from torchtitan.models.attention import ScaledDotProductAttentionWrapper
+from torchtitan.models.common.attention import ScaledDotProductAttention
 
 from torchtitan_npu.converters.kernels.dsa import SparseLightningIndexerKLLoss
 from torchtitan_npu.distributed.context_parallel.dsa_cp import (
@@ -123,13 +124,20 @@ class TestPatchDsaForContextParallel:
             TestPatchDsaForContextParallel._restore_class_state(snapshot)
 
     @staticmethod
-    def test_sets_model_args_when_provided():
+    def test_sets_dsa_shape_attrs_when_model_args_provided():
         snapshot = TestPatchDsaForContextParallel._snapshot_class_state()
         try:
             mock_mesh = MagicMock()
-            mock_args = MagicMock()
+            mock_args = SimpleNamespace(
+                layers=[
+                    SimpleNamespace(
+                        attention=SimpleNamespace(kv_lora_rank=32, qk_rope_head_dim=8)
+                    )
+                ]
+            )
             patch_dsa_for_context_parallel(cp_mesh=mock_mesh, model_args=mock_args)
-            assert DSV32_SDPA.model_args is mock_args
+            assert DSV32_SDPA.kv_lora_rank == 32
+            assert DSV32_SDPA.qk_rope_head_dim == 8
         finally:
             TestPatchDsaForContextParallel._restore_class_state(snapshot)
 
@@ -182,22 +190,37 @@ class TestPatchDsaForContextParallel:
 
     @staticmethod
     def _snapshot_class_state():
+        attrs = [
+            "cp_mesh",
+            "model_args",
+            "compute_dsa_indexer_loss",
+            "kv_lora_rank",
+            "qk_rope_head_dim",
+            "tp_mesh",
+        ]
         return {
             "forward": DSV32_SDPA.forward,
-            "had_cp_mesh": hasattr(DSV32_SDPA, "cp_mesh"),
-            "had_model_args": hasattr(DSV32_SDPA, "model_args"),
-            "had_loss": hasattr(DSV32_SDPA, "compute_dsa_indexer_loss"),
+            "attrs": {
+                attr: getattr(DSV32_SDPA, attr)
+                for attr in attrs
+                if hasattr(DSV32_SDPA, attr)
+            },
         }
 
     @staticmethod
     def _restore_class_state(snapshot):
         DSV32_SDPA.forward = snapshot["forward"]
-        for attr, had in [
-            ("cp_mesh", snapshot["had_cp_mesh"]),
-            ("model_args", snapshot["had_model_args"]),
-            ("compute_dsa_indexer_loss", snapshot["had_loss"]),
+        for attr in [
+            "cp_mesh",
+            "model_args",
+            "compute_dsa_indexer_loss",
+            "kv_lora_rank",
+            "qk_rope_head_dim",
+            "tp_mesh",
         ]:
-            if not had and hasattr(DSV32_SDPA, attr):
+            if attr in snapshot["attrs"]:
+                setattr(DSV32_SDPA, attr, snapshot["attrs"][attr])
+            elif hasattr(DSV32_SDPA, attr):
                 delattr(DSV32_SDPA, attr)
 
 
@@ -323,7 +346,7 @@ class TestPatchUlyssesForContextParallel:
         try:
             mock_mesh = MagicMock()
             patch_ulysses_for_context_parallel(cp_mesh=mock_mesh)
-            assert ScaledDotProductAttentionWrapper.cp_mesh is mock_mesh
+            assert ScaledDotProductAttention.cp_mesh is mock_mesh
         finally:
             TestPatchUlyssesForContextParallel._restore_class_state(snapshot)
 
@@ -331,10 +354,10 @@ class TestPatchUlyssesForContextParallel:
     def test_forward_replaced_with_wrapper():
         snapshot = TestPatchUlyssesForContextParallel._snapshot_class_state()
         try:
-            original = ScaledDotProductAttentionWrapper.forward
+            original = ScaledDotProductAttention.forward
             mock_mesh = MagicMock()
             patch_ulysses_for_context_parallel(cp_mesh=mock_mesh)
-            assert ScaledDotProductAttentionWrapper.forward is not original
+            assert ScaledDotProductAttention.forward is not original
         finally:
             TestPatchUlyssesForContextParallel._restore_class_state(snapshot)
 
@@ -351,7 +374,7 @@ class TestPatchUlyssesForContextParallel:
                 call_count["n"] += 1
                 return tensor
 
-            module = ScaledDotProductAttentionWrapper()
+            module = ScaledDotProductAttention(None)
             q = torch.randn(1, 4, 8, 16)
             k = torch.randn(1, 4, 8, 16)
             v = torch.randn(1, 4, 8, 16)
@@ -360,7 +383,7 @@ class TestPatchUlyssesForContextParallel:
                 "torchtitan_npu.distributed.context_parallel.ulysses_cp.all_to_all",
                 side_effect=counting_a2a,
             ):
-                ScaledDotProductAttentionWrapper.forward(module, q, k, v)
+                ScaledDotProductAttention.forward(module, q, k, v)
 
             assert call_count["n"] == 4
         finally:
@@ -369,17 +392,17 @@ class TestPatchUlyssesForContextParallel:
     @staticmethod
     def _snapshot_class_state():
         return {
-            "forward": ScaledDotProductAttentionWrapper.forward,
-            "had_cp_mesh": hasattr(ScaledDotProductAttentionWrapper, "cp_mesh"),
+            "forward": ScaledDotProductAttention.forward,
+            "had_cp_mesh": hasattr(ScaledDotProductAttention, "cp_mesh"),
         }
 
     @staticmethod
     def _restore_class_state(snapshot):
-        ScaledDotProductAttentionWrapper.forward = snapshot["forward"]
+        ScaledDotProductAttention.forward = snapshot["forward"]
         if not snapshot["had_cp_mesh"] and hasattr(
-            ScaledDotProductAttentionWrapper, "cp_mesh"
+            ScaledDotProductAttention, "cp_mesh"
         ):
-            del ScaledDotProductAttentionWrapper.cp_mesh
+            delattr(ScaledDotProductAttention, "cp_mesh")
 
 
 class TestValidateUlyssesConfigs:
