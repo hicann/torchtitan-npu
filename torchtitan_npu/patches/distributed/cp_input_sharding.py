@@ -13,15 +13,11 @@ from torchtitan.tools.logging import init_logger, logger
 init_logger()
 
 
-def _is_custom_cp_target(trainer) -> bool:
+def _is_dsa_cp_target(trainer) -> bool:
     if not getattr(trainer.parallel_dims, "cp_enabled", False):
         return False
 
     model_name = str(getattr(getattr(trainer.config, "model_spec", None), "name", ""))
-
-    # DeepSeek-V4 always requires sequential sharding (window attention + compressor)
-    if "deepseek_v4" in model_name:
-        return True
 
     # Qwen3 only supports Ulysses CP (not upstream HeadTail ring attention),
     # so cp_enabled=True always means Ulysses CP → sequential sharding required
@@ -47,7 +43,7 @@ def _patch_post_dataloading_process_for_dsa_cp() -> None:
 
     @wraps(original)
     def wrapper(self, input_dict, labels):
-        if not _is_custom_cp_target(self):
+        if not _is_dsa_cp_target(self):
             return original(self, input_dict, labels)
 
         parallelism_cfg = self.config.parallelism
@@ -63,7 +59,7 @@ def _patch_post_dataloading_process_for_dsa_cp() -> None:
     titan_train.Trainer.post_dataloading_process = wrapper
     logger.info(
         "[Patch] Registered post_dataloading hook for CP sequential sharding "
-        "(forces context_parallel_load_balancer=None for deepseek_v4, qwen3, and deepseek_v32+DSA)."
+        "(forces context_parallel_load_balancer=None for qwen3, and deepseek_v32+DSA)."
     )
 
 

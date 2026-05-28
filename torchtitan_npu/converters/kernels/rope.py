@@ -109,7 +109,12 @@ def npu_apply_rotary_emb_complex(
     if positions is None:
         freqs_cis = freqs_cis_local[0:seqlen]
     elif positions.size(0) == 1:
-        freqs_cis = freqs_cis_local[positions.squeeze(0)]
+        # NOTE: Indexing into the full freqs_cis table by absolute
+        # positions. Use the real view to avoid complex64 indexing
+        # issues on NPU.
+        freqs_cis_real = torch.view_as_real(freqs_cis_local)
+        freqs_cis_real = freqs_cis_real[positions.squeeze(0)]
+        freqs_cis = torch.view_as_complex(freqs_cis_real)
     else:
         freqs_cis_expanded = freqs_cis_local[None, :, None, :].expand(
             xq_local.shape[0], -1, -1, -1
@@ -159,7 +164,12 @@ def npu_apply_rotary_emb_single_complex(
     if positions is None:
         freqs_cis = freqs_cis_local[0:seqlen]
     elif positions.size(0) == 1:
-        freqs_cis = freqs_cis_local[positions.squeeze(0)]
+        # NOTE: Indexing into the full freqs_cis table by absolute
+        # positions. Use the real view to avoid complex64 indexing
+        # issues on NPU.
+        freqs_cis_real = torch.view_as_real(freqs_cis_local)
+        freqs_cis_real = freqs_cis_real[positions.squeeze(0)]
+        freqs_cis = torch.view_as_complex(freqs_cis_real)
     else:
         freqs_cis_expanded = freqs_cis_local[None, :, None, :].expand(
             x_local.shape[0], -1, -1, -1

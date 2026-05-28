@@ -46,7 +46,6 @@ from torchtitan_npu.models.deepseek_v4.model import (
     DSAIndexerLossLoggingHelper,
 )
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -178,10 +177,11 @@ def _patch_post_attention_projection_for_tp(post_attention: nn.Module) -> None:
         bsz: int,
         seqlen: int,
         n_local_groups: int,
+        positions: torch.Tensor | None = None,
     ):
         rd = self.rope_head_dim
         o_nope, o_rope = torch.split(o, [self.head_dim - rd, rd], dim=-1)
-        o_rope = apply_rotary_emb(o_rope, freqs_cis, True)
+        o_rope = apply_rotary_emb(o_rope, freqs_cis, True, positions=positions)
         o = torch.cat([o_nope, o_rope], dim=-1)
         o = o.view(bsz, seqlen, n_local_groups, -1)
         wo_a = self.wo_a.weight.view(n_local_groups, self.o_lora_rank, -1)
@@ -247,16 +247,6 @@ def parallelize_deepseek_v4(
             f"Got attn_type={attn_type!r}. "
             f"FlexAttention and varlen attention are not supported with CP."
         )
-
-    if parallelism.context_parallel_degree > 1:
-        from torchtitan_npu.distributed.context_parallel.deepseek_v4_cp import (
-            patch_deepseek_v4_for_context_parallel,
-        )
-
-        cp_mesh = parallel_dims.get_mesh("cp")
-        # pyrefly: ignore [bad-argument-type]
-        patch_deepseek_v4_for_context_parallel(model, cp_mesh)
-        logger.info("Applied Context Parallel to DeepSeek-V4 model")
 
     # patch the indexer loss tracking with distributed version to get the synchronized indexer loss metric
     apply_distributed_indexer_loss_tracking(parallel_dims)
@@ -695,10 +685,10 @@ def apply_non_moe_tp(
                 use_local_output=False,
             ),
             "attention.inner_attention.sparse_attn": attention_kernel_plan,
+            "attention.inner_attention.li_loss": li_loss_plan,
             "hc_post": hc_post_plan,
             "hc_pre": hc_pre_plan,
             "hc_pre.torch_hc_split_sinkhorn": hc_pre_sinkhon_plan,
-            "cal_index_loss.li_loss": li_loss_plan,
             "ffn_norm": SequenceParallel(),
         }
         # pyrefly: ignore [missing-attribute]
@@ -905,7 +895,7 @@ def _compile_moe_transformer_block(
             raise RuntimeError(
                 f"Checkpoint-wrapped block child {attr_name!r} is not exposed on wrapper"
             )
-        if attr_name in {"cal_index_loss", "hc_pre"}:
+        if attr_name in {"hc_pre"}:
             continue
         if isinstance(submod, Attention):
             _compile_children_except(submod, {"inner_attention"}, compile_config)
