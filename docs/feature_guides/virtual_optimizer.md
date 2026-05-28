@@ -2,7 +2,7 @@
 
 ## 背景与挑战
 
-在大集群训练中，PP的增大会对前些个stage造成较大的显存压力；同时我们观察到，在增大梯度累积的情况下，优化器部分的一二阶动量显存swap的开销可忽略不计，因此可通过将优化器部分的显存swap到cpu上来节省整网显存，而当前分布式优化器逻辑复杂，并且与各种通信并行相互耦合，因此实现一套Swap优化器显存的系统较为复杂。
+在大集群训练中，PP的增大会对前几个stage造成较大的显存压力；同时我们观察到，在增大梯度累积的情况下，优化器部分的一二阶动量显存swap的开销可忽略不计，因此可通过将优化器部分的显存swap到cpu上来节省整网显存，而当前分布式优化器逻辑复杂，并且与各种通信并行相互耦合，因此实现一套Swap优化器显存的系统较为复杂。
 
 
 ## 特性概述
@@ -52,8 +52,8 @@ state['exp_avg_sq'] = torch_npu.empty_with_swapped_memory(
 
 | 配置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `Virtual_optimizer` | bool | False | 是否启用 Virtual Optimizer 特性以进行显存卸载。 |
-| `Virtual_optimizer_size` | float/str | 2.0 | 申请的虚拟内存空间大小，如果希望Swap掉所有的一二阶动量，可以设置为`all` |
+| `virtual_optimizer` | bool | False | 是否启用 Virtual Optimizer 特性以进行显存卸载。 |
+| `virtual_optimizer_size` | float/str | 2.0 | 申请的虚拟内存空间大小，如果希望Swap掉所有的一二阶动量，可以设置为`all` |
 
 
 ### 配置示例

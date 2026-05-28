@@ -11,11 +11,11 @@ torchtitan_npu在deepseek_v32模型的基础上进一步适配了MTP训练特性
 
 ## 配置选项
 
-在训练任务的 TOML 配置文件（例如 `torchtitan_npu/models/deepseek_v32/train_configs/deepseek_v32_671b_debug.toml`，或实际启动训练时 `--job.config_file` 所指向的路径）中，找到对应的 [training] 节，并添加以下配置以启用 MTP训练：
+在训练任务的 TOML 配置文件（例如 `torchtitan_npu/models/deepseek_v32/train_configs/deepseek_v32_671b_debug.toml`，或实际启动训练时 `--job.config_file` 所指向的路径）中，找到对应的 `[training]` 节，并添加以下配置以启用 MTP训练：
 
 | 配置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `num_mtp_modules` | int | 0(不开MTP) | MTP预测的token个数 |
+| `num_mtp_modules` | int | 0（不开MTP） | MTP预测的token个数 |
 | `mtp_loss_weight` | float | 0.3 | MTP训练损失的权重，total_loss = main_loss + `mtp_loss_weight` * mtp_loss |
 
 ### 配置示例

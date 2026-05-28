@@ -64,7 +64,7 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-> 注：如有旧版本Torchtitan-npu，请先[卸载](#卸载)，再进行安装
+> 注：如有旧版本torchtitan-npu，请先[卸载](#卸载)，再进行安装
 
 
 ### 4. 安装inductor-npu-ext（可选，使能torch.compile时需要）
