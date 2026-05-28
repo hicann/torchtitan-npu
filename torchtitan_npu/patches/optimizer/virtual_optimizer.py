@@ -23,6 +23,7 @@ import torch_npu
 import torchtitan
 import torchtitan.components.optimizer
 from torch.distributed._tensor import DTensor
+from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 
 logger = logging.getLogger(__name__)
 
@@ -218,11 +219,47 @@ def sanitize(obj):
 
 
 def _process_state_tensor(state, k):
-    local_t = unwrap_dtensor(state[k])
-    cpu_t = local_t.cpu().clone()
-    if hasattr(cpu_t, "swap_tensor"):
-        object.__delattr__(cpu_t, "swap_tensor")
-    state[k] = wrap_like_param(cpu_t, state[k])
+    """
+    Process optimizer state tensor before checkpoint save.
+    Safely handle DTensor and NPU swap tensors, move to CPU in standard format.
+    """
+    tensor = state[k]
+    local_t = unwrap_dtensor(tensor)
+
+    # Ensure tensor is in normal device memory (not swap)
+    if local_t.device.type != "cpu":
+        # Create a standard device tensor to copy swap data out
+        standard_tensor = torch.empty_like(local_t, memory_format=torch.preserve_format)
+        standard_tensor.copy_(local_t)
+
+        # Clean up swap marker attribute
+        if hasattr(standard_tensor, "swap_tensor"):
+            object.__delattr__(standard_tensor, "swap_tensor")
+        local_t = standard_tensor
+
+    # Move to CPU and clone for safe serialization
+    cpu_tensor = local_t.cpu().clone()
+
+    # Clean swap attribute on CPU tensor
+    if hasattr(cpu_tensor, "swap_tensor"):
+        object.__delattr__(cpu_tensor, "swap_tensor")
+
+    # For plain tensors, directly replace
+    if not isinstance(tensor, DTensor):
+        state[k] = cpu_tensor
+        return
+
+    # Rebuild DTensor with CPU local tensor and original distributed spec
+    spec = DTensorSpec(
+        tensor.device_mesh,
+        tensor.placements,
+        tensor_meta=TensorMeta(
+            shape=cpu_tensor.shape,
+            stride=cpu_tensor.stride(),
+            dtype=cpu_tensor.dtype,
+        ),
+    )
+    state[k] = DTensor(cpu_tensor, spec, requires_grad=cpu_tensor.requires_grad)
 
 
 def _save_original_states(self):
@@ -413,7 +450,6 @@ def build_optimizers_with_virtual_optimizer(
         model_parts, optimizer_config, parallel_dims, ft_manager
     )
 
-    # Simplified PP info (should be retrieved from parallel_dims in real scenario)
     pp_rank, pp_size = 0, 1
 
     for opt in optimizers:
