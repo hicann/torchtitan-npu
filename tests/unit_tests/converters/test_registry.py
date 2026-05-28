@@ -72,6 +72,7 @@ def test_core_converter_registrations_exist():
         "torchtitan_npu.converters.kernels.rms_norm",
         "torchtitan_npu.converters.kernels.rope",
         "torchtitan_npu.converters.kernels.permute",
+        "torchtitan_npu.converters.features.vlm",
     ):
         module = importlib.import_module(module_name)
         importlib.reload(module)
@@ -81,6 +82,7 @@ def test_core_converter_registrations_exist():
         "npu_rms_norm",
         "npu_rope",
         "npu_permute",
+        "npu_vlm",
     ]
     for name in expected_model_converter_names:
         config = registry().get(name)

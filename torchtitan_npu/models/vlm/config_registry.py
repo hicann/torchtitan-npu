@@ -22,7 +22,7 @@ from torchtitan_npu.config.configs import (
     ProfilingConfig,
     TrainingConfig,
 )
-from torchtitan_npu.converters.npu_registry import get_model_converter_config
+from torchtitan_npu.converters.registry import get_model_converter_config
 
 from . import model_registry
 

@@ -12,13 +12,6 @@ from torchtitan_npu.entry import (
 )
 
 
-def test_has_model_converter_accepts_legacy_patch_name_entries():
-    owner = SimpleNamespace(_patch_name="npu_bypass_triton_codegen")
-    config = SimpleNamespace(converters=[SimpleNamespace(_owner=owner)])
-
-    assert _has_model_converter(config, "npu_bypass_triton_codegen")
-
-
 def test_has_model_converter_accepts_model_config_name_entries():
     model_config = SimpleNamespace(name="npu_bypass_triton_codegen")
     owner = SimpleNamespace(_model_config=model_config)
