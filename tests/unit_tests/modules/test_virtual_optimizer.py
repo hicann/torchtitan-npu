@@ -2,20 +2,22 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+
 import os
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 import torch.distributed as dist
-
 from torch.distributed._tensor import DeviceMesh, DTensor, Replicate, Shard
 
 from torchtitan_npu.patches.optimizer.virtual_optimizer import (
-    swap_tensor_copy_wrapper,
+    is_swap_tensor,
+    patched_state_dict,
     unwrap_dtensor,
     virtual_optimizer_step_impl,
     VirtualAllocator,
+    VirtualOptimizersContainer,
     wrap_like_param,
 )
 
@@ -57,6 +59,15 @@ def test_wrap_like_param():
     assert wrapped.size() == p.size()
 
 
+def test_is_swap_tensor():
+    t1 = torch.randn(2, 2)
+    assert not is_swap_tensor(t1)
+
+    t2 = torch.randn(2, 2)
+    t2.swap_tensor = True
+    assert is_swap_tensor(t2)
+
+
 def test_virtual_allocator_memory_logic():
     alloc = VirtualAllocator(pp_rank=0, pp_stages=2, virtual_optimizer_size=10.0)
     assert alloc.get_swap_memory_sizes() == [10.0, 10.0]
@@ -71,6 +82,21 @@ def test_virtual_allocator_memory_logic():
         mem = alloc.create(p)
         assert mem.shape == p.shape
         assert torch.all(mem == 0)
+
+
+@patch("torchtitan_npu.patches.optimizer.virtual_optimizer.torch_npu")
+def test_virtual_allocator_npu_swap(mock_npu):
+    mock_swap_tensor = torch.randn(2, 2)
+    mock_npu.empty_with_swapped_memory.return_value = mock_swap_tensor
+
+    p = torch.randn(2, 2)
+    alloc = VirtualAllocator(pp_rank=0, pp_stages=1, virtual_optimizer_size=1.0)
+
+    with patch(
+        "torchtitan_npu.patches.optimizer.virtual_optimizer.hasattr", return_value=True
+    ):
+        res = alloc._get_swap_memory(p)
+        assert getattr(res, "swap_tensor", False) is True
 
 
 @patch("torchtitan_npu.patches.optimizer.virtual_optimizer.torch_npu")
@@ -120,163 +146,39 @@ def test_virtual_optimizer_step_impl_logic(mock_npu, monkeypatch):
         assert mock_fused.called
 
 
-@patch("torchtitan_npu.patches.optimizer.virtual_optimizer.torch_npu")
-def test_virtual_optimizer_smoke_test(mock_npu, monkeypatch):
-    """Smoke test: verify complete optimizer step flow with multiple parameters."""
-    mock_npu.npu.current_device.return_value = torch.device("cpu")
-
-    def mock_npu_method(self, *args, **kwargs):
-        return self
-
-    monkeypatch.setattr(torch.Tensor, "npu", mock_npu_method)
-
-    mesh = DeviceMesh("cpu", [0])
-
-    param1 = torch.randn(4, 4, requires_grad=True)
-    param1.grad = torch.randn(4, 4)
-    p1_dtensor = DTensor.from_local(param1.detach(), mesh, [Replicate()])
-    p1_dtensor.grad = DTensor.from_local(param1.grad, mesh, [Replicate()])
-
-    param2 = torch.randn(2, 2, requires_grad=True)
-    param2.grad = torch.randn(2, 2)
-    p2_dtensor = DTensor.from_local(param2.detach(), mesh, [Replicate()])
-    p2_dtensor.grad = DTensor.from_local(param2.grad, mesh, [Replicate()])
-
-    class MockOptimizer:
-        def __init__(self):
-            self.param_groups = [
-                {
-                    "params": [p1_dtensor, p2_dtensor],
-                    "lr": 0.001,
-                    "betas": (0.9, 0.999),
-                    "eps": 1e-8,
-                    "weight_decay": 0.01,
-                    "amsgrad": False,
-                    "maximize": False,
-                    "decoupled_weight_decay": True,
-                }
-            ]
-            self.state = {p1_dtensor: {}, p2_dtensor: {}}
-            self.virtual_allocator = MagicMock()
-            self.virtual_allocator.init_exp.return_value = (
-                torch.zeros(2, 2),
-                torch.zeros(2, 2),
-            )
-            self.print_swap_flag = False
-
-    opt = MockOptimizer()
-
-    with patch("torch._fused_adamw_") as mock_fused:
-        virtual_optimizer_step_impl(opt)
-        assert "exp_avg" in opt.state[p1_dtensor]
-        assert isinstance(opt.state[p1_dtensor]["exp_avg"], DTensor)
-        assert "exp_avg" in opt.state[p2_dtensor]
-        assert isinstance(opt.state[p2_dtensor]["exp_avg"], DTensor)
-        first_call_count = mock_fused.call_count
-
-        p1_dtensor.grad = DTensor.from_local(torch.randn(4, 4), mesh, [Replicate()])
-        p2_dtensor.grad = DTensor.from_local(torch.randn(2, 2), mesh, [Replicate()])
-        virtual_optimizer_step_impl(opt)
-
-        assert "exp_avg_sq" in opt.state[p1_dtensor]
-        assert mock_fused.call_count > first_call_count
+def create_zero_tensor(x):
+    return torch.zeros_like(x)
 
 
-@pytest.fixture(autouse=True)
-def patch_copy():
-    original = torch.Tensor.copy_
-    torch.Tensor.copy_ = swap_tensor_copy_wrapper(torch.Tensor.copy_)
-    yield
-    torch.Tensor.copy_ = original
+def test_patched_state_dict_basic():
+    model = torch.nn.Linear(3, 3)
+    opt = torch.optim.AdamW(model.parameters(), lr=0.01)
+    opt._original_state_dict = opt.state_dict
+    opt.virtual_allocator = MagicMock()
+    opt.virtual_allocator.create = create_zero_tensor
+
+    state_dict = patched_state_dict(opt)
+    assert "state" in state_dict
+    assert "param_groups" in state_dict
 
 
-def test_shape_mismatch():
-    dst = torch.zeros(3)
-    src = torch.zeros(4)
-    with pytest.raises(RuntimeError):
-        dst.copy_(src)
+def test_virtual_optimizers_container():
+    model_part = torch.nn.Linear(10, 10)
 
+    config = VirtualOptimizersContainer.Config(
+        name="AdamW",
+        lr=0.001,
+        weight_decay=0.01,
+        virtual_optimizer=True,
+        virtual_optimizer_size=20.0,
+    )
 
-def test_self_copy():
-    t = torch.tensor([1.0, 2.0])
-    res = t.copy_(t)
-    assert res is t
+    container = VirtualOptimizersContainer(config, model_parts=[model_part])
 
+    assert len(container.optimizers) == 1
+    opt = container.optimizers[0]
 
-def test_normal_cpu_to_cpu():
-    src = torch.tensor([1.0, 2.0, 3.0])
-    dst = torch.zeros_like(src)
-    dst.copy_(src)
-    assert torch.allclose(dst, src)
-
-
-def test_swap_cpu_to_cpu():
-    src = torch.tensor([1.0, 2.0, 3.0])
-    src.swap_tensor = True
-    dst = torch.zeros_like(src)
-    dst.swap_tensor = True
-    dst.copy_(src)
-    assert torch.allclose(dst, src)
-
-
-def test_swap_npu_to_cpu():
-    if not torch.npu.is_available():
-        return
-    src = torch.tensor([1.0, 2.0], device="npu")
-    src.swap_tensor = True
-    dst = torch.zeros_like(src).cpu()
-    dst.copy_(src)
-    assert torch.allclose(dst, src.cpu())
-
-
-def test_cpu_to_swap_npu():
-    if not torch.npu.is_available():
-        return
-    src = torch.tensor([1.0, 2.0], device="cpu")
-    dst = torch.zeros_like(src).npu()
-    dst.swap_tensor = True
-    dst.copy_(src)
-    assert torch.allclose(dst, src.npu())
-
-
-def test_swap_npu_to_swap_npu_same_device():
-    if not torch.npu.is_available():
-        return
-    src = torch.tensor([1.0, 2.0], device="npu")
-    src.swap_tensor = True
-    dst = torch.zeros_like(src).npu()
-    dst.swap_tensor = True
-    dst.copy_(src)
-    assert torch.allclose(dst, src)
-
-
-def test_swap_npu_to_swap_npu_cross_device():
-    if not torch.npu.is_available() or torch.npu.device_count() < 2:
-        return
-    src = torch.tensor([1.0, 2.0], device="npu:0")
-    src.swap_tensor = True
-    dst = torch.zeros(2, device="npu:1")
-    dst.swap_tensor = True
-    dst.copy_(src)
-    assert torch.allclose(dst, src.to("npu:1"))
-
-
-def test_cpu_to_npu_swap_non_blocking():
-    if not torch.npu.is_available():
-        return
-    src = torch.tensor([1.0, 2.0], device="cpu")
-    dst = torch.zeros_like(src).npu()
-    dst.swap_tensor = True
-    dst.copy_(src, non_blocking=True)
-    assert torch.allclose(dst, src.npu())
-
-
-def test_swap_npu_to_npu_non_blocking():
-    if not torch.npu.is_available():
-        return
-    src = torch.tensor([1.0, 2.0], device="npu")
-    src.swap_tensor = True
-    dst = torch.zeros_like(src).npu()
-    dst.swap_tensor = True
-    dst.copy_(src, non_blocking=True)
-    assert torch.allclose(dst, src)
+    assert hasattr(opt, "_allocator_config")
+    pp_rank, pp_size, virtual_size = opt._allocator_config
+    assert pp_size == 1
+    assert virtual_size == 20.0

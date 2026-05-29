@@ -26,7 +26,12 @@ def _apply_patches():
     _apply_init_distributed_patch()
 
     # patching optimizer before importing torchtitan.models
-    from .patches.optimizer import swap_optimizer  # noqa: F401 # usort:skip
+
+    from .patches.optimizer.optimizer_selector import (
+        patch_npu_optimizer_framework,
+    )  # noqa: F401 # usort:skip
+
+    patch_npu_optimizer_framework()
 
     import torchtitan.models as titan_models
 

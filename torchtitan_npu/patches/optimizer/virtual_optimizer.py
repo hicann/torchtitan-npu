@@ -14,16 +14,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import logging
+from dataclasses import dataclass
 from functools import wraps
-from typing import Any, cast
+from typing import Any, cast, ClassVar, TypeVar
 
 import torch
+import torch.nn as nn
 import torch_npu
 from torch.distributed._tensor import DTensor
+from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
+from torch.optim import Optimizer
+from torchtitan.components.optimizer import OptimizersContainer
 
 logger = logging.getLogger(__name__)
 
+T = TypeVar("T", bound=Optimizer)
 OPTIMIZER_STATE_KEYS = ["exp_avg", "exp_avg_sq", "max_exp_avg_sq"]
 
 
@@ -184,6 +191,8 @@ class VirtualAllocator:
 
     def _get_swap_memory(self, p: torch.Tensor):
         """Internal: Logic for NPU swapped memory allocation."""
+        if p.numel() == 0:
+            return torch.zeros_like(p)
         if not hasattr(torch_npu, "empty_with_swapped_memory"):
             return self.get_memory(p)
         try:
@@ -212,11 +221,33 @@ def sanitize(obj):
 
 
 def _process_state_tensor(state, k):
-    local_t = unwrap_dtensor(state[k])
+    tensor = state[k]
+    local_t = unwrap_dtensor(tensor)
+    if local_t.device.type != "cpu":
+        device_t = torch.empty_like(local_t, memory_format=torch.preserve_format)
+        device_t.copy_(local_t)
+        if hasattr(device_t, "swap_tensor"):
+            object.__delattr__(device_t, "swap_tensor")
+        local_t = device_t
+
     cpu_t = local_t.cpu().clone()
     if hasattr(cpu_t, "swap_tensor"):
         object.__delattr__(cpu_t, "swap_tensor")
-    state[k] = wrap_like_param(cpu_t, state[k])
+
+    if not isinstance(tensor, DTensor):
+        state[k] = cpu_t
+        return
+
+    spec = DTensorSpec(
+        tensor.device_mesh,
+        tensor.placements,
+        tensor_meta=TensorMeta(
+            shape=tensor.size(),
+            stride=tensor.stride(),
+            dtype=cpu_t.dtype,
+        ),
+    )
+    state[k] = DTensor(cpu_t.view_as(cpu_t), spec, requires_grad=cpu_t.requires_grad)
 
 
 def _save_original_states(self):
@@ -368,3 +399,25 @@ def _make_patched_load(orig_load):
         virtual_optimizer_replace(self)
 
     return patched_load
+
+
+class VirtualOptimizersContainer(OptimizersContainer):
+    @dataclass(kw_only=True, slots=True)
+    class Config(OptimizersContainer.Config):
+        _owner: ClassVar[type | None] = None
+        virtual_optimizer: bool = False
+        virtual_optimizer_size: Any = None
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        model_parts: list[nn.Module],
+    ) -> None:
+        super().__init__(config=config, model_parts=model_parts)
+        pp_rank, pp_size = 0, 1
+        virtual_size = config.virtual_optimizer_size
+        for opt in self.optimizers:
+            opt._allocator_config = (pp_rank, pp_size, virtual_size)
+
+        logger.info("[VirtualOptimizer] Container initialized and config injected.")
