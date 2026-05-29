@@ -717,7 +717,30 @@ def apply_non_moe_tp(
                     "hnorm": SequenceParallel(),
                     "e_proj": SequenceParallel(use_local_output=True),
                     "h_proj": SequenceParallel(use_local_output=True),
+                    "mtp_norm": SequenceParallel(),
+                    "mtp_hc_head": hc_head_plan,
                 }
+            )
+            _register_distributed_parameter(
+                # pyrefly: ignore [bad-argument-type]
+                transformer_block,
+                "mtp_hc_head_fn",
+                tp_mesh,
+                [Replicate()],
+            )
+            _register_distributed_parameter(
+                # pyrefly: ignore [bad-argument-type]
+                transformer_block,
+                "mtp_hc_head_base",
+                tp_mesh,
+                [Replicate()],
+            )
+            _register_distributed_parameter(
+                # pyrefly: ignore [bad-argument-type]
+                transformer_block,
+                "mtp_hc_head_scale",
+                tp_mesh,
+                [Replicate()],
             )
 
         parallelize_module(

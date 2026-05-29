@@ -1028,6 +1028,15 @@ class MTPModule(DeepSeekV4TransformerBlock):
         self.e_proj = nn.Linear(model_args.dim, model_args.dim, bias=False)
         self.h_proj = nn.Linear(model_args.dim, model_args.dim, bias=False)
         self.hc_mult = hc_mult = model_args.hc_mult
+        hc_dim = hc_mult * model_args.dim
+        origin_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(torch.float32)
+        self.mtp_hc_head_fn = nn.Parameter(torch.empty(hc_mult, hc_dim))
+        self.mtp_hc_head_base = nn.Parameter(torch.empty(hc_mult))
+        self.mtp_hc_head_scale = nn.Parameter(torch.empty(1))
+        torch.set_default_dtype(origin_dtype)
+        self.mtp_hc_head = HcHead(model_args.norm_eps, model_args.hc_eps)
+        self.mtp_norm = RMSNorm(model_args.dim, model_args.norm_eps)
 
     # pyrefly: ignore [bad-param-name-override]
     def forward(
@@ -1071,14 +1080,22 @@ class MTPModule(DeepSeekV4TransformerBlock):
         x = self.ffn_norm(x)
         x = self.moe(x, input_ids)
         x = self.hc_post(x, residual, post, comb)
-        return x
+        x = self.mtp_hc_head(
+            x, self.mtp_hc_head_fn, self.mtp_hc_head_scale, self.mtp_hc_head_base
+        )
+        prev_embed = x
+        x = self.mtp_norm(x) if self.mtp_norm is not None else x
+        return prev_embed, x
 
     def init_weights(self, buffer_device: torch.device):
         super().init_weights(buffer_device=buffer_device)
-        for norm in (self.enorm, self.hnorm):
+        for norm in (self.enorm, self.hnorm, self.mtp_norm):
             nn.init.trunc_normal_(norm.weight, mean=1, std=0.02)
         nn.init.trunc_normal_(self.e_proj.weight, mean=0.0, std=0.02)
         nn.init.trunc_normal_(self.h_proj.weight, mean=0.0, std=0.02)
+        nn.init.trunc_normal_(self.mtp_hc_head_fn, mean=0.0, std=0.02)
+        nn.init.trunc_normal_(self.mtp_hc_head_base, mean=0.0, std=0.02)
+        nn.init.trunc_normal_(self.mtp_hc_head_scale, mean=0.0, std=0.02)
 
 
 class DeepSeekV4Model(ModelProtocol):
@@ -1208,7 +1225,7 @@ class DeepSeekV4Model(ModelProtocol):
                 # https://github.com/pytorch/pytorch/pull/179849
                 input_offset = _wait_async_collective_tensor(input_offset)
                 layer_id = mtp_layer_id + self.model_args.n_layers
-                h = self.layers[str(layer_id)](
+                prev_embed, h = self.layers[str(layer_id)](
                     input_offset,
                     prev_embed,
                     input_ids,
@@ -1218,15 +1235,6 @@ class DeepSeekV4Model(ModelProtocol):
                     attention_masks,
                     positions=positions,
                 )
-                h = (
-                    self.hc_head(
-                        h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
-                    )
-                    if self.hc_head is not None
-                    else h
-                )
-                prev_embed = h
-                h = self.norm(h) if self.norm is not None else h
                 output = self.output(h.float()) if self.output is not None else h
                 output_list[mtp_layer_id + 1] = output
         return output_list

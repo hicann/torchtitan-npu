@@ -132,6 +132,10 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
                         "layers.{}.hnorm.weight": "layers.{}.hnorm.weight",
                         "layers.{}.e_proj.weight": "layers.{}.e_proj.weight",
                         "layers.{}.h_proj.weight": "layers.{}.h_proj.weight",
+                        "layers.{}.norm.weight": "layers.{}.mtp_norm.weight",
+                        "layers.{}.hc_head_fn": "layers.{}.mtp_hc_head_fn",
+                        "layers.{}.hc_head_base": "layers.{}.mtp_hc_head_base",
+                        "layers.{}.hc_head_scale": "layers.{}.mtp_hc_head_scale",
                     }
                 )
         # configs
@@ -186,6 +190,8 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
             else:
                 new_key = key
             new_state_dict[new_key] = tensor
+        new_state_dict["mtp.0.head.weight"] = state_dict["head.weight"]
+        new_state_dict["mtp.0.emb.tok_emb.weight"] = state_dict["embed.weight"]
         return new_state_dict
 
     def to_hf_new(self, state_dict: dict[str, Any]) -> dict[str, Any]:
@@ -243,8 +249,8 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
             else:
                 new_key = to_hf_map[key]
                 hf_state_dict[new_key] = value
-
-        hf_state_dict = self.to_hf_mtp(hf_state_dict)
+        if self.model_args.num_mtp_modules > 0:  # pyrefly: ignore [missing-attribute]
+            hf_state_dict = self.to_hf_mtp(hf_state_dict)
 
         return hf_state_dict
 
@@ -296,6 +302,9 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
             if match:
                 num = int(match.group(1))
                 rest = match.group(2)
+                # pyrefly: ignore [redundant-condition]
+                if "head.weight" in rest or "tok_emb" in rest:
+                    continue  # skip mtp head weight since it's merged into the last layer's output projection
                 # pyrefly: ignore [missing-attribute]
                 new_key = f"layers.{self.model_args.n_layers}.{rest}"
             else:
@@ -313,8 +322,8 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
         state_dict = {}
         expert_weights_by_layer = {}  # {layer: {abstract_key: {expert_id: tensor}}}
         passthrough = self._from_hf_passthrough
-
-        hf_state_dict = self.from_hf_mtp(hf_state_dict)
+        if self.model_args.num_mtp_modules > 0:  # pyrefly: ignore [missing-attribute]
+            hf_state_dict = self.from_hf_mtp(hf_state_dict)
 
         for key, value in hf_state_dict.items():
             if any(token in key for token in passthrough):
