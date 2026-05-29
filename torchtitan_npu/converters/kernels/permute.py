@@ -28,6 +28,7 @@ from torchtitan_npu.converters.model_custom_interface import (
     ParallelizePlanUpdater,
 )
 from torchtitan_npu.converters.registry import register_model_converter
+from torchtitan_npu.distributed.process_group import is_fake_process_group
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,43 @@ class NpuPermuteConverter(ModelCustomConverter):
 
 
 class NpuExpertParallel(ExpertParallel):
+    def _compute_all_to_all_splits(
+        self,
+        num_tokens_per_expert: torch.Tensor,
+        ep_degree: int,
+        device_mesh: DeviceMesh,
+    ) -> tuple[torch.Tensor, list[int]]:
+        # Generate the input/output splits for all-to-all and stash them on
+        # self. Returns (num_tokens_per_expert_group, output_splits) for the
+        # downstream local shuffle.
+        group = device_mesh.get_group()
+        is_fake = is_fake_process_group(group)
+        with torch.no_grad():
+            input_splits = (
+                num_tokens_per_expert.view(ep_degree, -1)
+                .sum(dim=1)
+                .to(torch.device("cpu"), non_blocking=not is_fake)
+            )
+            if is_fake:
+                num_tokens_per_expert_group = num_tokens_per_expert
+                output_splits = input_splits
+            else:
+                num_tokens_per_expert_group = all_to_all_single(
+                    num_tokens_per_expert,
+                    None,
+                    None,
+                    group=group,
+                )
+                # NOTE: this would incur a device-to-host sync
+                output_splits = (
+                    num_tokens_per_expert_group.view(ep_degree, -1)
+                    .sum(dim=1)
+                    .to(torch.device("cpu"), non_blocking=False)
+                )
+            self.input_splits = input_splits.tolist()
+            self.output_splits = output_splits.tolist()
+        return num_tokens_per_expert_group, self.output_splits
+
     def _token_dispatch(
         self, mod: nn.Module, inputs: tuple, device_mesh: DeviceMesh
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -161,35 +199,18 @@ class NpuExpertParallel(ExpertParallel):
         ep_degree = device_mesh.shape[0]
         num_local_experts = num_tokens_per_expert.shape[0] // ep_degree
 
-        # generate the input splits and output splits for all-to-all
-        with torch.no_grad():
-            num_tokens_per_expert_group = all_to_all_single(
-                num_tokens_per_expert,
-                None,
-                None,
-                group=device_mesh.get_group(),
-            )
-            input_splits = (
-                num_tokens_per_expert.view(ep_degree, -1)
-                .sum(dim=1)
-                .to(torch.device("cpu"), non_blocking=True)
-            )
-            # NOTE: this would incur a device-to-host sync
-            output_splits = (
-                num_tokens_per_expert_group.view(ep_degree, -1)
-                .sum(dim=1)
-                .to(torch.device("cpu"), non_blocking=False)
-            )
-            self.input_splits = input_splits.tolist()
-            self.output_splits = output_splits.tolist()
-
-        # perform all-to-all
-        routed_input = all_to_all_single_autograd(
-            routed_input,
-            self.output_splits,
-            self.input_splits,
-            device_mesh.get_group(),
+        num_tokens_per_expert_group, output_splits = self._compute_all_to_all_splits(
+            num_tokens_per_expert, ep_degree, device_mesh
         )
+
+        if not is_fake_process_group(device_mesh.get_group()):
+            # perform all-to-all
+            routed_input = all_to_all_single_autograd(
+                routed_input,
+                self.output_splits,
+                self.input_splits,
+                device_mesh.get_group(),
+            )
 
         # NOTE: After this all-to-all, the routed input is put on proper EP rank.
         # However, the num_tokens_per_expert_group is not of the final target format
@@ -207,7 +228,7 @@ class NpuExpertParallel(ExpertParallel):
             .repeat(ep_degree)
             .repeat_interleave(
                 num_tokens_per_expert_group.view(-1),
-                output_size=sum(self.output_splits),
+                output_size=sum(output_splits),
             )
         )
 
@@ -229,6 +250,9 @@ class NpuExpertParallel(ExpertParallel):
         routed_output = NPUMoeTokenUnpermute.apply(
             routed_output, self.permuted_indices, routed_output.shape
         )
+        if is_fake_process_group(device_mesh.get_group()):
+            return routed_output
+
         routed_output = all_to_all_single_autograd(
             routed_output,
             self.input_splits,

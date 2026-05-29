@@ -21,6 +21,9 @@ Usage:
     python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v32_tp
     python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v4_fsdp_ep
     python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v32_fsdp_ep
+    python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v3_fake_backend_ep
+    python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v4_fake_backend_ep
+    python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v32_fake_backend_ep
     python tests/smoke_tests/integration_test.py ./outputs --ngpu 4
 """
 
@@ -49,6 +52,7 @@ class OverrideDefinitions:
     test_descr: str = "default"
     test_name: str = "default"
     ngpu: int = 4
+    env_vars: Sequence[str] = tuple()
     disabled: bool = False
 
     def __repr__(self):
@@ -85,7 +89,11 @@ def _build_cmd(
 
     all_ranks = ",".join(map(str, range(test_flavor.ngpu)))
 
-    cmd = f"NGPU={test_flavor.ngpu} LOG_RANK={all_ranks} " "bash ./scripts/run_train.sh"
+    env_vars = " ".join(
+        ["NGPU=" + str(test_flavor.ngpu), "LOG_RANK=" + all_ranks]
+        + list(test_flavor.env_vars)
+    )
+    cmd = env_vars + " bash ./scripts/run_train.sh"
 
     # Append dump_folder
     cmd += " " + dump_folder_arg
@@ -313,8 +321,54 @@ def _ep_tests() -> List[OverrideDefinitions]:
     ]
 
 
+def _fake_backend_tests() -> List[OverrideDefinitions]:
+    """Fake backend tests for single-process distributed dry runs."""
+    fake_backend_env = ("COMM_MODE=fake_backend",)
+    return [
+        OverrideDefinitions(
+            [
+                [
+                    f"--module {_DEEPSEEK_V3_MODULE}",
+                    f"--config {_DEEPSEEK_V3_CONFIG}",
+                    "--parallelism.expert_parallel_degree 2",
+                ]
+            ],
+            "DeepSeek V3 fake_backend FSDP+EP",
+            "deepseek_v3_fake_backend_ep",
+            ngpu=2,
+            env_vars=fake_backend_env,
+        ),
+        OverrideDefinitions(
+            [
+                [
+                    f"--module {_DEEPSEEK_V4_MODULE}",
+                    f"--config {_DEEPSEEK_V4_CONFIG}",
+                    "--parallelism.expert_parallel_degree 2",
+                ]
+            ],
+            "DeepSeek V4 fake_backend FSDP+EP",
+            "deepseek_v4_fake_backend_ep",
+            ngpu=2,
+            env_vars=fake_backend_env,
+        ),
+        OverrideDefinitions(
+            [
+                [
+                    f"--module {_DEEPSEEK_V32_MODULE}",
+                    f"--config {_DEEPSEEK_V32_CONFIG}",
+                    "--parallelism.expert_parallel_degree 2",
+                ]
+            ],
+            "DeepSeek V3.2 fake_backend FSDP+EP",
+            "deepseek_v32_fake_backend_ep",
+            ngpu=2,
+            env_vars=fake_backend_env,
+        ),
+    ]
+
+
 def generate_smoke_tests() -> List[OverrideDefinitions]:
-    return _base_tests() + _tp_tests() + _ep_tests()
+    return _fake_backend_tests() + _base_tests() + _tp_tests() + _ep_tests()
 
 
 # ============================================================================

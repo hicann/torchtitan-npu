@@ -10,6 +10,10 @@ The NPU GMM converter fuses w1+w3 into w13 and sets w1/w3 to None.
 The upstream TensorParallel._partition_fn and ExpertTensorParallel._partition_fn
 unconditionally access module.w1 / module.w3, which crashes when those are None.
 This patch adds None-guards and w13 sharding support.
+
+It also adds a fake-backend path for ExpertParallel token dispatch. PyTorch's
+FakeProcessGroup returns tensors with valid metadata but arbitrary values, while
+MoE expert parallelism uses all-to-all exchanged token counts as split sizes.
 """
 
 import torch
@@ -17,6 +21,8 @@ import torch.nn as nn
 
 import torchtitan.distributed.expert_parallel as ep_module
 from torch.distributed.tensor import DeviceMesh, distribute_tensor, DTensor, Shard
+
+from torchtitan_npu.distributed.process_group import is_fake_process_group
 
 
 def _distribute_w13_interleaved(w13_param, device_mesh):
@@ -129,7 +135,61 @@ def _etp_partition_fn(self, name: str, mod: nn.Module, device_mesh: DeviceMesh) 
         mod.register_parameter("w13", nn.Parameter(w13_dt))
 
 
+_ORIG_EXPERT_TOKEN_DISPATCH = ep_module.ExpertParallel._token_dispatch
+_ORIG_EXPERT_TOKEN_COMBINE = ep_module.ExpertParallel._token_combine
+
+
+def _expert_parallel_token_dispatch(self, mod: nn.Module, inputs: tuple, device_mesh):
+    if not is_fake_process_group(device_mesh.get_group()):
+        return _ORIG_EXPERT_TOKEN_DISPATCH(self, mod, inputs, device_mesh)
+
+    routed_input, num_tokens_per_expert = inputs
+    ep_degree = device_mesh.shape[0]
+    num_local_experts = num_tokens_per_expert.shape[0] // ep_degree
+
+    with torch.no_grad():
+        input_splits = (
+            num_tokens_per_expert.view(ep_degree, -1)
+            .sum(dim=1)
+            .to(torch.device("cpu"), non_blocking=False)
+        )
+        self.input_splits = input_splits.tolist()
+        self.output_splits = list(self.input_splits)
+
+    # FakeProcessGroup does not preserve all_to_all tensor values. Expert routing
+    # uses exchanged token counts as split sizes, so synthesize a deterministic
+    # local layout and keep real communication paths untouched.
+    (
+        self.input_shape,
+        routed_input,
+        self.permuted_indices,
+        num_tokens_per_expert_group,
+    ) = ep_module._permute(
+        routed_input,
+        num_tokens_per_expert,
+        ep_degree,
+        num_local_experts,
+    )
+
+    return routed_input, num_tokens_per_expert_group
+
+
+def _expert_parallel_token_combine(
+    self, mod: nn.Module, routed_output: torch.Tensor, device_mesh
+):
+    if not is_fake_process_group(device_mesh.get_group()):
+        return _ORIG_EXPERT_TOKEN_COMBINE(self, mod, routed_output, device_mesh)
+
+    return ep_module._unpermute(
+        routed_output,
+        self.input_shape,
+        self.permuted_indices,
+    )
+
+
 _PARTITION_FN = "_partition_fn"
 setattr(ep_module.TensorParallel, _PARTITION_FN, _tp_partition_fn)
 if hasattr(ep_module, "ExpertTensorParallel"):
     setattr(ep_module.ExpertTensorParallel, _PARTITION_FN, _etp_partition_fn)
+ep_module.ExpertParallel._token_dispatch = _expert_parallel_token_dispatch
+ep_module.ExpertParallel._token_combine = _expert_parallel_token_combine
