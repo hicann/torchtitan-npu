@@ -72,6 +72,9 @@ def _apply_patches():
         pipelining,
     )
 
+    # patching FSDP2 DTensor dtype sync (backport from PyTorch main)
+    from .patches.torch.fsdp import fsdp_dtype_fix  # noqa: F401
+
     # patching fake process group
     from .patches.torch.testing._internal.distributed import fake_pg  # noqa: F401
 

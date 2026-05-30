@@ -18,7 +18,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointWrapper,
 )
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import distribute_tensor, DTensor, Replicate, Shard
+from torch.distributed.tensor import distribute_tensor, Replicate, Shard
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     parallelize_module,
@@ -42,7 +42,7 @@ from torchtitan.models.llama3.parallelize import apply_replicate
 from torchtitan.models.llama4.parallelize import apply_fsdp
 
 from torchtitan_npu.models.common.dsa_indexer_loss import DSAIndexerLossLoggingHelper
-from torchtitan_npu.models.deepseek_v4.model import apply_rotary_emb, Attention
+from torchtitan_npu.models.deepseek_v4.model import Attention
 
 logger = logging.getLogger(__name__)
 
@@ -157,64 +157,6 @@ def _register_distributed_parameter(
         )
     )
     module.register_parameter(name, dt)
-
-
-def _patch_post_attention_projection_for_tp(post_attention: nn.Module) -> None:
-    """Apply the TP-only PostAttention projection path.
-
-    PostAttention uses a grouped einsum over wo_a.weight directly, so the
-    standard ColwiseParallel module wrapper cannot intercept this projection.
-    """
-    if getattr(post_attention.forward, "__name__", "") == "_tp_forward":
-        return
-
-    def _tp_forward(
-        self,
-        o: torch.Tensor,
-        freqs_cis: torch.Tensor,
-        bsz: int,
-        seqlen: int,
-        n_local_groups: int,
-        positions: torch.Tensor | None = None,
-    ):
-        rd = self.rope_head_dim
-        o_nope, o_rope = torch.split(o, [self.head_dim - rd, rd], dim=-1)
-        o_rope = apply_rotary_emb(o_rope, freqs_cis, True, positions=positions)
-        o = torch.cat([o_nope, o_rope], dim=-1)
-        o = o.view(bsz, seqlen, n_local_groups, -1)
-        wo_a = self.wo_a.weight.view(n_local_groups, self.o_lora_rank, -1)
-
-        if isinstance(o, DTensor) and isinstance(wo_a, DTensor):
-            # pyrefly: ignore [missing-attribute]
-            o_device_mesh = o.device_mesh
-            # pyrefly: ignore [missing-attribute]
-            wo_a_device_mesh = wo_a.device_mesh
-            if o_device_mesh != wo_a_device_mesh:
-                raise RuntimeError(
-                    "PostAttention TP projection expects o and wo_a on the same "
-                    "device mesh."
-                )
-            o_placements = o.placements
-            o_local = o.to_local()
-            wo_a_local = wo_a.to_local().to(o_local.dtype)
-            o = torch.einsum("bsgd,grd->bsgr", o_local, wo_a_local)
-            o = DTensor.from_local(
-                o,
-                device_mesh=o_device_mesh,
-                placements=o_placements,
-                run_check=False,
-            )
-        elif isinstance(o, DTensor) or isinstance(wo_a, DTensor):
-            raise RuntimeError(
-                "PostAttention TP projection expects o and wo_a to both be "
-                "DTensor or both be Tensor."
-            )
-        else:
-            o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
-
-        return self.wo_b(o.reshape(bsz, seqlen, -1))
-
-    post_attention.forward = _tp_forward.__get__(post_attention, type(post_attention))
 
 
 def parallelize_deepseek_v4(
@@ -677,10 +619,6 @@ def apply_non_moe_tp(
             attention_kernel_plan = attention_kernel_plan_ratio4
         else:
             attention_kernel_plan = attention_kernel_plan_ratio128
-
-        # pyrefly: ignore [missing-attribute]
-        attention = transformer_block.attention
-        _patch_post_attention_projection_for_tp(attention.post_attention)
 
         layer_plan = {
             "attention_norm": SequenceParallel(),
