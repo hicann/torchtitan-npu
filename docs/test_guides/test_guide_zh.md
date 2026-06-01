@@ -4,25 +4,25 @@
 ### 单元测试
 ```bash
 # 运行全部单元测试，并生成报告
-sh build.sh -u --generate-report
+bash .ci/unit_test.sh --generate-report
 
 # 只运行本仓 `torchtitan-npu` 的单元测试
-RUN_TORCHTITAN_UT=false sh build.sh -u --generate-report
+RUN_TORCHTITAN_UT=false bash .ci/unit_test.sh --generate-report
 ```
 
 ### 冒烟测试
 ```bash
 # 运行默认 smoke 套件（core + extended）
-sh build.sh -s --generate-report
+bash .ci/smoke_test.sh --generate-report
 
 # 只运行 core smoke
-ONLY_CORE_SMOKE=true sh build.sh -s --generate-report
+ONLY_CORE_SMOKE=true bash .ci/smoke_test.sh --generate-report
 
 # 只运行 extended smoke
-ONLY_EXTENDED_SMOKE=true sh build.sh -s --generate-report
+ONLY_EXTENDED_SMOKE=true bash .ci/smoke_test.sh --generate-report
 
 # 只运行 upstream smoke
-ONLY_UPSTREAM_SMOKE=true sh build.sh -s --generate-report
+ONLY_UPSTREAM_SMOKE=true bash .ci/smoke_test.sh --generate-report
 ```
 
 ### 集成测试 (Integration Test)
@@ -35,8 +35,8 @@ ONLY_UPSTREAM_SMOKE=true sh build.sh -s --generate-report
 #### 运行方式
 
 ```bash
-# 通过 build.sh 运行（默认运行 core + extended smoke）
-ONLY_CORE_SMOKE=true sh build.sh -s --generate-report
+# 通过 .ci/smoke_test.sh 运行（默认运行 core + extended smoke）
+ONLY_CORE_SMOKE=true bash .ci/smoke_test.sh --generate-report
 
 # 独立运行 integration_test.py
 python tests/smoke_tests/integration_test.py output_dir \
@@ -106,18 +106,18 @@ RUN_MODEL_PARALLEL_MULTI_RANK=true torchrun --nproc_per_node=4 -m pytest -v test
 ## 什么时候用哪个命令
 | 命令 | 适用场景 |
 |---|---|
-| `build.sh -u` | 修改的是硬件无关逻辑，比如 converter、config、helper、patch |
-| `build.sh -s` | 修改的是真实 NPU 执行链路或 wrapper 行为，并希望跑默认的 core + extended smoke |
+| `.ci/unit_test.sh` | 修改的是硬件无关逻辑，比如 converter、config、helper、patch |
+| `.ci/smoke_test.sh` | 修改的是真实 NPU 执行链路或 wrapper 行为，并希望跑默认的 core + extended smoke |
 | `ONLY_CORE_SMOKE=true` | 修改了最小训练主链路（即 integration_test 中定义的端到端集成测试） |
 | `ONLY_EXTENDED_SMOKE=true` | 修改了本仓特性或模型并行行为 |
 | `ONLY_UPSTREAM_SMOKE=true` | 修改依赖上游 torchtitan 集成链路的逻辑，或需要单独跑更重的 upstream smoke |
 
 ## 快速判断
-- 只改了硬件无关逻辑：先跑 `build.sh -u`
-- 改了 NPU 特性链路或 wrapper：跑 `build.sh -s`
-- 改了训练主链路接线：至少跑 `ONLY_CORE_SMOKE=true build.sh -s`
-- 改了模型并行行为：跑 `ONLY_EXTENDED_SMOKE=true build.sh -s`
-- 需要检查上游集成兼容性：单独跑 `ONLY_UPSTREAM_SMOKE=true build.sh -s`
+- 只改了硬件无关逻辑：先跑 `.ci/unit_test.sh`
+- 改了 NPU 特性链路或 wrapper：跑 `.ci/smoke_test.sh`
+- 改了训练主链路接线：至少跑 `ONLY_CORE_SMOKE=true .ci/smoke_test.sh`
+- 改了模型并行行为：跑 `ONLY_EXTENDED_SMOKE=true .ci/smoke_test.sh`
+- 需要检查上游集成兼容性：单独跑 `ONLY_UPSTREAM_SMOKE=true .ci/smoke_test.sh`
 
 ## 测试报告
 - 输出目录：`test_reports/`
@@ -129,6 +129,6 @@ RUN_MODEL_PARALLEL_MULTI_RANK=true torchrun --nproc_per_node=4 -m pytest -v test
 
 ## 使用建议
 1. 先跑和改动最匹配的最小命令。
-2. 不依赖 NPU 的改动，优先跑 `build.sh -u`。
+2. 不依赖 NPU 的改动，优先跑 `.ci/unit_test.sh`。
 3. 能定向跑 smoke 子集时，就不要默认全量跑。
 4. 如果测试布局或执行方式变了，记得同步更新文档。

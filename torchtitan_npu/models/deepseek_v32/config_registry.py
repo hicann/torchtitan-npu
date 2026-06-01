@@ -36,7 +36,7 @@ def _default_converters() -> list:
 
 def deepseek_v32_671b_4layers_debug() -> TrainerConfig:
     return TrainerConfig(
-        hf_assets_path="./checkpoint/DeepSeek-V3.2",
+        hf_assets_path="./assets/hf/DeepSeek-V3.2",
         model_spec=model_registry("671B_debug_4_layers"),
         debug=DebugConfig(print_config=True),
         model_converters=ModelConvertersContainer.Config(
@@ -103,7 +103,7 @@ def deepseek_v32_671b_4layers_debug() -> TrainerConfig:
 
 def deepseek_v32_671b_61layers_4k_128die() -> TrainerConfig:
     return TrainerConfig(
-        hf_assets_path="./checkpoint/DeepSeek-V3.2",
+        hf_assets_path="./assets/hf/DeepSeek-V3.2",
         model_spec=model_registry("671B_debug_128die"),
         debug=DebugConfig(print_config=True),
         model_converters=ModelConvertersContainer.Config(
@@ -159,7 +159,7 @@ def deepseek_v32_671b_61layers_4k_128die() -> TrainerConfig:
 
 def deepseek_v32_671b_61layers_32k_128die() -> TrainerConfig:
     return TrainerConfig(
-        hf_assets_path="./checkpoint/DeepSeek-V3.2",
+        hf_assets_path="./assets/hf/DeepSeek-V3.2",
         model_spec=model_registry("671B_debug_128die"),
         debug=DebugConfig(print_config=True),
         model_converters=ModelConvertersContainer.Config(
