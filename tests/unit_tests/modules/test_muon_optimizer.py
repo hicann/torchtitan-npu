@@ -3,12 +3,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import math
 import types
 
 import pytest
 import torch
 import torch.nn as nn
-
 from torch.optim.lr_scheduler import LambdaLR
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 
@@ -333,15 +333,17 @@ def test_state_dict_roundtrip(muon_optimizer_config, cpu_parallel_dims):
 # --- TestBuildOptimizersWrapper ---
 
 
-def test_muon_with_swap_optimizer_raises():
+def test_muon_with_swap_and_virtual_raises():
     import torchtitan.components.optimizer as tt_optimizer
 
     optimizer_config = types.SimpleNamespace(
         name="Muon",
         swap_optimizer=True,
-        virtual_optimizer=False,
+        virtual_allocator=True,
     )
-    with pytest.raises(ValueError, match="does not support swap_optimizer"):
+    with pytest.raises(
+        ValueError, match="Cannot use both swap_optimizer and virtual_allocator"
+    ):
         tt_optimizer.build_optimizers(
             model_parts=[],
             optimizer_config=optimizer_config,
@@ -545,3 +547,280 @@ def test_match_rms_adamw_uses_standard_scheduler(
     assert isinstance(
         schedulers, LRSchedulersContainer
     ), f"match_rms_adamw should use standard LRSchedulersContainer, got {type(schedulers)}"
+
+
+# --- TestSwapMuonOptimizer ---
+
+
+def test_muon_swap_optimizer_routing_and_config(monkeypatch):
+    import torchtitan.components.optimizer as tt_optimizer
+
+    import torchtitan_npu.patches.optimizer.swap_muon_optimizer as swap_mod
+
+    sentinel = object()
+    recorded = {}
+
+    def fake_build_swap(model_parts, optimizer_config, parallel_dims, ft_manager=None):
+        recorded["swap_optimizer_times"] = getattr(
+            optimizer_config, "swap_optimizer_times", 16
+        )
+        recorded["swap_merge_buckets"] = getattr(
+            optimizer_config, "swap_merge_buckets", 1
+        )
+        recorded["model_parts"] = model_parts
+        return sentinel
+
+    monkeypatch.setattr(swap_mod, "build_swap_muon_hybrid_optimizers", fake_build_swap)
+
+    config = types.SimpleNamespace(
+        name="Muon",
+        swap_optimizer=True,
+        virtual_allocator=False,
+        swap_optimizer_times=8,
+        swap_merge_buckets=4,
+        lr=1e-3,
+        weight_decay=0.01,
+        muon_lr=None,
+        muon_momentum=0.95,
+        muon_enable_nesterov=True,
+        muon_ns_steps=5,
+        muon_adjust_lr_fn="original",
+        muon_hybrid_ns=False,
+        beta1=0.9,
+        beta2=0.95,
+        eps=1e-8,
+        implementation="for-loop",
+        extra_param_group_split_rules=None,
+    )
+
+    result = tt_optimizer.build_optimizers(
+        model_parts=[],
+        optimizer_config=config,
+        parallel_dims=None,
+        ft_manager=None,
+    )
+
+    assert result is sentinel
+    assert recorded["swap_optimizer_times"] == 8
+    assert recorded["swap_merge_buckets"] == 4
+
+
+def test_build_swap_muon_hybrid_optimizers_wrapping(monkeypatch):
+    import torchtitan_npu.patches.optimizer.swap_muon_optimizer as swap_mod
+
+    fake_base_optimizers = [object(), object()]
+    fake_adjust_lr_fn = "original"
+    base_container = types.SimpleNamespace(
+        optimizers=fake_base_optimizers,
+        muon_adjust_lr_fn=fake_adjust_lr_fn,
+    )
+
+    recorded = {}
+
+    fake_container_cls = type(
+        "FakeSwapMuonHybridOptimizersContainer",
+        (),
+        {"__init__": lambda self, *a, **kw: None},
+    )
+
+    original_cls = swap_mod.SwapMuonHybridOptimizersContainer
+
+    def fake_init(
+        self,
+        model_parts,
+        optimizers,
+        muon_adjust_lr_fn=None,
+        swap_optimizer_times=16,
+        swap_merge_buckets=1,
+    ):
+        recorded["model_parts"] = model_parts
+        recorded["optimizers"] = optimizers
+        recorded["muon_adjust_lr_fn"] = muon_adjust_lr_fn
+        recorded["swap_optimizer_times"] = swap_optimizer_times
+        recorded["swap_merge_buckets"] = swap_merge_buckets
+
+    fake_container_cls.__init__ = fake_init
+
+    monkeypatch.setattr(
+        swap_mod, "build_muon_hybrid_optimizers", lambda *a, **kw: base_container
+    )
+    monkeypatch.setattr(
+        swap_mod, "SwapMuonHybridOptimizersContainer", fake_container_cls
+    )
+
+    model_parts = [_DummyModel()]
+    config = types.SimpleNamespace(
+        swap_optimizer_times=12,
+        swap_merge_buckets=3,
+    )
+    parallel_dims = None
+
+    result = swap_mod.build_swap_muon_hybrid_optimizers(
+        model_parts, config, parallel_dims
+    )
+
+    assert isinstance(result, fake_container_cls)
+    assert recorded["model_parts"] is model_parts
+    assert recorded["optimizers"] is fake_base_optimizers
+    assert recorded["muon_adjust_lr_fn"] == fake_adjust_lr_fn
+    assert recorded["swap_optimizer_times"] == 12
+    assert recorded["swap_merge_buckets"] == 3
+
+    monkeypatch.setattr(swap_mod, "SwapMuonHybridOptimizersContainer", original_cls)
+
+
+def test_swap_muon_state_lifecycle(monkeypatch):
+    from torchtitan_npu.patches.optimizer.swap_muon_optimizer import SwapMuonState
+
+    p = torch.randn(4, 4)
+
+    original_zeros_like = torch.zeros_like
+
+    def zeros_like_no_pin(input, *, pin_memory=False, device=None, **kwargs):
+        return original_zeros_like(input, device=device or input.device, **kwargs)
+
+    monkeypatch.setattr(torch, "zeros_like", zeros_like_no_pin)
+
+    import torchtitan_npu.patches.optimizer.swap_muon_optimizer as swap_mod
+
+    monkeypatch.setattr(swap_mod.torch, "zeros_like", zeros_like_no_pin)
+
+    class _FakeStream:
+        def record_event(self):
+            return None
+
+    class _FakeDeviceModule:
+        Stream = _FakeStream
+
+        @staticmethod
+        def current_stream():
+            return _FakeStream()
+
+    fake_device = _FakeDeviceModule()
+    swap_state = SwapMuonState(p, fake_device)
+
+    momentum_buffer = torch.randn(4, 4)
+    state = {"momentum_buffer": momentum_buffer}
+    swap_state.optim_state = state
+
+    swap_state.init_from_momentum_buffer(momentum_buffer)
+
+    assert swap_state.cpu_momentum is not None
+    assert torch.allclose(swap_state.cpu_momentum, momentum_buffer)
+    assert state["momentum_buffer"] is None
+    assert swap_state.on_device is False
+
+    swap_state.swap_to_device(stream=None)
+    assert state["momentum_buffer"] is not None
+    assert torch.allclose(state["momentum_buffer"], swap_state.cpu_momentum)
+    assert swap_state.on_device is True
+
+    state["momentum_buffer"].fill_(1.0)
+
+    swap_state.swap_to_host(stream=None)
+    assert torch.all(swap_state.cpu_momentum == 1.0)
+    assert state["momentum_buffer"] is None
+    assert swap_state.on_device is False
+
+
+def test_swap_merge_buckets_scheduling():
+    from torchtitan_npu.patches.optimizer.muon_optimizer import (
+        DistributedMuon,
+        SwapMergeContext,
+    )
+
+    opt = DistributedMuon.__new__(DistributedMuon)
+
+    opt._swap_merge_buckets = 4
+    assert opt._swap_merge_buckets == 4
+
+    total_buckets = 10
+    swap_merge_buckets = opt._swap_merge_buckets
+    num_merge_groups = math.ceil(total_buckets / swap_merge_buckets)
+    assert num_merge_groups == 3
+
+    groups = []
+    for merge_idx in range(num_merge_groups):
+        start = merge_idx * swap_merge_buckets
+        end = min(start + swap_merge_buckets, total_buckets)
+        groups.append((start, end))
+
+    assert groups[0] == (0, 4)
+    assert groups[1] == (4, 8)
+    assert groups[2] == (8, 10)
+
+    swap_ctx = SwapMergeContext(
+        merge_buckets=swap_merge_buckets,
+        use_swap=True,
+        to_device_stream=None,
+        to_host_stream=None,
+    )
+    assert swap_ctx.merge_buckets == 4
+    assert swap_ctx.use_swap is True
+
+    opt._swap_merge_buckets = 1
+    total_buckets = 5
+    num_merge_groups = math.ceil(total_buckets / opt._swap_merge_buckets)
+    assert num_merge_groups == 5
+
+
+def test_swap_muon_hybrid_checkpoint_roundtrip(monkeypatch):
+    from torchtitan_npu.patches.optimizer.swap_muon_optimizer import (
+        SwapMuonHybridOptimizersContainer,
+        SwapMuonState,
+    )
+
+    original_zeros_like = torch.zeros_like
+
+    def zeros_like_no_pin(input, *, pin_memory=False, device=None, **kwargs):
+        return original_zeros_like(input, device=device or input.device, **kwargs)
+
+    monkeypatch.setattr(torch, "zeros_like", zeros_like_no_pin)
+    import torchtitan_npu.patches.optimizer.swap_muon_optimizer as swap_mod
+
+    monkeypatch.setattr(swap_mod.torch, "zeros_like", zeros_like_no_pin)
+
+    container = SwapMuonHybridOptimizersContainer.__new__(
+        SwapMuonHybridOptimizersContainer
+    )
+    container._muon_swap_states = {}
+
+    p = torch.randn(4, 4)
+    state = {"momentum_buffer": None}
+    swap_state = SwapMuonState(p, torch)
+    swap_state.optim_state = state
+
+    initial_buf = torch.randn(4, 4)
+    swap_state.init_from_momentum_buffer(initial_buf)
+    container._muon_swap_states[id(p)] = swap_state
+
+    fake_muon_optim = types.SimpleNamespace(state={p: state})
+
+    serialized = container._serialize_momentum_buffer(p, fake_muon_optim)
+    assert serialized is not None
+    assert torch.allclose(serialized, swap_state.cpu_momentum)
+
+    container2 = SwapMuonHybridOptimizersContainer.__new__(
+        SwapMuonHybridOptimizersContainer
+    )
+    container2._muon_swap_states = {}
+
+    p2 = torch.randn(4, 4)
+    state2 = {"momentum_buffer": torch.randn(4, 4)}
+    swap_state2 = SwapMuonState(p2, torch)
+    swap_state2.optim_state = state2
+    swap_state2.on_device = True
+    container2._muon_swap_states[id(p2)] = swap_state2
+
+    fake_muon_optim2 = types.SimpleNamespace(state={p2: state2})
+
+    container2._load_momentum_from_state_dict(
+        swap_state2, serialized, fake_muon_optim2, p2
+    )
+
+    assert swap_state2.cpu_momentum is not None
+    assert torch.allclose(swap_state2.cpu_momentum, serialized)
+    assert swap_state2.on_device is False
+    assert state2["momentum_buffer"] is None
+    assert swap_state2.buf_shape == p2.shape
+    assert swap_state2.buf_dtype == p2.dtype

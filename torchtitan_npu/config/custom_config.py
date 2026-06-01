@@ -85,6 +85,13 @@ class Optimizer(BaseOptimizer):
     """Whether to enable virtual optimizer (swap optimizer states to CPU for Muon)"""
     virtual_allocator: bool = False
 
+    """(Muon only) When using swap optimizer with Muon, configures the number of communication buckets
+    to merge for swap H2D/D2H batching. Higher values reduce stream synchronization
+    overhead but increase peak NPU memory. Default 1 = no merging (original behavior).
+    2 = merge 2 buckets per H2D/D2H batch.
+    """
+    swap_merge_buckets: int = 1
+
 
 @dataclass
 class Parallelism(BaseParallelism):

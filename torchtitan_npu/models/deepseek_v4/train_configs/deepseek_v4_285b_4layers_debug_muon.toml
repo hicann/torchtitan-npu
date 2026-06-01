@@ -36,7 +36,8 @@ muon_enable_nesterov = true
 muon_ns_steps = 10
 muon_adjust_lr_fn = "match_rms_adamw"
 muon_hybrid_ns = true
-virtual_allocator = true
+swap_optimizer = true
+swap_merge_buckets = 4
 
 [lr_scheduler]
 warmup_steps = 4

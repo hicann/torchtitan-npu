@@ -87,13 +87,13 @@ $$\gamma_{\text{adjusted}} = 0.18 \times \gamma \times \sqrt{\max(A, B)}$$
 
 **Expert 路径**（`step_experts`）：专家权重已通过 Expert Parallel 切分到各 rank，每个 rank 独立对本地专家参数执行 LMO，无需跨卡通信。
 
-### Virtual Allocator（可选）
+### Swap Optimizer（推荐）
 
-对于显存受限的场景，Muon 优化器支持通过 `virtual_allocator = true` 启用优化器状态 CPU 卸载。
+对于显存受限的场景，Muon 优化器支持通过 `swap_optimizer = true` 启用优化器状态 CPU 卸载，将 Muon 的 `momentum_buffer` 和 AdamW 的 `exp_avg`、`exp_avg_sq` 卸载到 CPU，仅在优化器 step 期间按需换入 NPU。
 
-- **初始化阶段**：Muon 的 `momentum_buffer` 和 AdamW 的 `exp_avg`、`exp_avg_sq` 均分配在 CPU 的 pinned memory 上
-- **step 阶段**：更新前将状态从 CPU 异步拷贝到 Device，更新完成后再异步拷贝回 CPU，释放 Device 显存
-- **Checkpoint 阶段**：保存/加载前自动将状态换入 Device，完成后换回 CPU
+#### swap_merge_buckets 配置
+
+`swap_merge_buckets` 控制 Muon momentum_buffer H2D/D2H 操作的合并粒度。Muon 参数被分成多个 bucket（由 FSDP all_to_all 通信决定），每个 bucket 独立执行一次 H2D（step 前）和 D2H（step 后）。`swap_merge_buckets` 决定将多少个连续 bucket 的 H2D/D2H 合并为一次 stream 操作。
 
 ## 配置选项
 
@@ -109,7 +109,8 @@ $$\gamma_{\text{adjusted}} = 0.18 \times \gamma \times \sqrt{\max(A, B)}$$
 | `muon_ns_steps` | int | 5 | Newton-Schulz 正交化迭代步数，影响正交化精度与计算开销。值越大正交化越精确，但计算量也越大 |
 | `muon_adjust_lr_fn` | str | "match_rms_adamw" | 学习率调整模式：`"original"` 或 `"match_rms_adamw"` |
 | `muon_hybrid_ns` | bool | False | 是否启用混合 Newton-Schulz 迭代（前 8 步用主系数，后续步用次系数） |
-| `virtual_allocator` | bool | False | 是否启用 Virtual Allocator，将优化器状态卸载到 CPU 以节省显存 |
+| `swap_optimizer` | bool | False | 是否启用 Swap Optimizer，将优化器状态卸载到 CPU 并异步换入换出以节省显存 |
+| `swap_merge_buckets` | int | 1 | Swap H2D/D2H 合并桶数。值越大 stream 同步开销越低但峰值显存略增。推荐 4~16 |
 
 ### 配置示例
 
@@ -151,9 +152,9 @@ muon_ns_steps = 5                        # 正交化步数
 muon_adjust_lr_fn = "original"           # 使用独立的 lr 调度器
 ```
 
-#### 示例 3：启用 Virtual Allocator
+#### 示例 3：启用 Swap Optimizer
 
-在显存受限的场景下，将优化器状态卸载到 CPU：
+在显存受限的场景下，将优化器状态卸载到 CPU，通过异步 H2D/D2H 流水线减少性能损失：
 
 ```toml
 [job]
@@ -168,12 +169,15 @@ muon_enable_nesterov = true
 muon_ns_steps = 10
 muon_adjust_lr_fn = "match_rms_adamw"
 muon_hybrid_ns = true
-virtual_allocator = true                 # 启用 Virtual Allocator，优化器状态卸载到 CPU
+swap_optimizer = true                    # 启用 Swap Optimizer，优化器状态卸载到 CPU
+swap_merge_buckets = 4                   # 每 4 个 bucket 合并一次 H2D/D2H，平衡性能与显存
 ```
 
 ## 注意事项
 
- **`swap_optimizer` 与 Muon 互斥**：Muon 优化器不支持与 Swap Optimizer 特性同时启用。如需节省显存，请使用 `virtual_allocator = true` 替代 `swap_optimizer = true`。
+- **`swap_optimizer` 与 `virtual_allocator` 互斥**：两者不能同时启用，请根据场景选择其一
+- **Swap Optimizer 推荐场景**：显存受限但希望尽量保持训练性能的场景。通过异步 stream overlap 实现 H2D/D2H 与计算的并行，性能损失较小
+- **断点续训兼容**：Swap Optimizer 的 `state_dict()` / `load_state_dict()` 已完整支持 checkpoint 保存与恢复，续训 loss 与连续训练完全一致
 
 ## 参考文献
 

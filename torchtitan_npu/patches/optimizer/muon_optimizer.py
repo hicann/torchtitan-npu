@@ -25,11 +25,11 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
     StateDictOptions,
 )
+from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import _StridedShard, Shard
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
-
 from torchtitan.components.ft import FTManager
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
@@ -71,11 +71,6 @@ def zeropower_via_newtonschulz5(grad, steps=10, eps=1e-7, hybrid_ns=False):
     is_2d = len(grad.shape) == 2
     if is_2d:
         grad = grad.unsqueeze(0)
-
-    if len(grad.shape) != 3:
-        raise ValueError(
-            f"Gradients must be 2D or 3D tensors after unsqueeze, got shape: {grad.shape}"
-        )
 
     original_dtype = grad.dtype
     x = grad.bfloat16()
@@ -189,6 +184,16 @@ class CommContext:
 
 
 @dataclass
+class SwapMergeContext:
+    """Swap-related context for FSDP merge group processing."""
+
+    merge_buckets: int
+    use_swap: bool
+    to_device_stream: Any = None
+    to_host_stream: Any = None
+
+
+@dataclass
 class InitInfo:
     """Initialization parameters for DistributedMuon."""
 
@@ -203,18 +208,6 @@ class InitInfo:
     communication_dtype: torch.dtype
     extra_reduce_for_hsdp: bool
     experts_weights_layout: str
-
-
-@dataclass
-class BucketSpec:
-    """Bucket specification for all-gather/scatter operations."""
-
-    start_idx: int
-    end_idx: int
-    local_updates: dict | None = None
-    global_updates: list | None = None
-    recv_shapes: list | None = None
-    send_shapes: list | None = None
 
 
 class DistributedMuon(Optimizer):
@@ -263,13 +256,113 @@ class DistributedMuon(Optimizer):
         self.groups_info = {}
         self.parameters_to_groups = {}
         self._refresh_groups_info()
+        self._param_type_map: dict[int, ParamType] = {}
+        self._expert_param_ids: set[int] = set()
+        self._fsdp_param_ids: set[int] = set()
+        self._ddp_param_ids: set[int] = set()
         self.ddp_params, self.ddp_param_names = [], []
         self.fsdp_params, self.fsdp_param_names = [], []
         self.expert_params, self.expert_param_names = [], []
         self._build_param_lists(param_names)
 
+        self._swap_enabled: bool = False
+        self._swap_container: Any = None
+        self._swap_merge_buckets: int = 1
+
+        self._device_module: Any = None
+        self._swap_to_device_stream: Any = None
+        self._swap_to_host_stream: Any = None
+
+    @staticmethod
     @torch.no_grad()
-    def get_momentum_or_grad(self, p, momentum, nesterov, gather_to_local=False):
+    def lmo(
+        g,
+        eps,
+        backend_steps,
+        transpose_experts=False,
+        adjust_lr_fn="original",
+        hybrid_ns=False,
+    ):
+        """LMO: Low-orthogonal Matrix Operation (zeropower + normalise).
+
+        Supports: 2D (linear), 3D (MoE expert).
+        """
+        g = g.to_local() if isinstance(g, DTensor) else g
+
+        def _orth_and_norm(x):
+            x = zeropower_via_newtonschulz5(
+                x, steps=backend_steps, eps=eps, hybrid_ns=hybrid_ns
+            )
+            x = DistributedMuon.normalise_grad(x, eps=eps, adjust_lr_fn=adjust_lr_fn)
+            return x
+
+        if g.ndim == 2:
+            return _orth_and_norm(g)
+        elif g.ndim == 3:
+            if g.shape[0] > 0:
+                g = g.transpose(1, 2) if transpose_experts else g
+                g = _orth_and_norm(g)
+                g = g.transpose(1, 2) if transpose_experts else g
+            return g
+        else:
+            raise ValueError(f"lmo expects 2D or 3D grad, got shape: {g.shape}")
+
+    @staticmethod
+    @torch.no_grad()
+    def normalise_grad(g, eps, adjust_lr_fn="original"):
+        """Normalise gradient tensor with spectral norm factor."""
+        a, b = g.size(-2), g.size(-1)
+        if adjust_lr_fn is None or adjust_lr_fn == "original":
+            g = g * math.sqrt(max(1, a / b))
+        elif adjust_lr_fn == "match_rms_adamw":
+            g = g * 0.18 * math.sqrt(max(a, b))  # deepseekV4 use 0.18
+        return g
+
+    @staticmethod
+    def _resolve_named_params(param_names, param_groups):
+        """Build (name, param) pairs from param_names and param_groups."""
+        all_params = []
+        for group in param_groups:
+            all_params.extend(group["params"])
+
+        if len(param_names) == len(all_params):
+            return list(zip(param_names, all_params))
+
+        named_params = []
+        for group in param_groups:
+            group_pnames = group.get("param_names", None)
+            if group_pnames is not None:
+                named_params.extend(zip(group_pnames, group["params"]))
+            else:
+                for p in group["params"]:
+                    named_params.append((f"param_{id(p)}", p))
+        return named_params
+
+    @staticmethod
+    def _snake_interleave(pairs, w):
+        """Snake-interleave pairs across w DP replicas."""
+        if w <= 1:
+            return pairs
+        # fmt: off
+        blocks = [pairs[i:i + w] for i in range(0, len(pairs), w)]
+        # fmt: on
+        for b, blk in enumerate(blocks):
+            if b % 2 == 1:
+                blk.reverse()
+        return [p for blk in blocks for p in blk]
+
+    @staticmethod
+    def _sort_pairs_by_numel(pairs, key_fn=None):
+        """Sort (param, name) pairs and unzip back into two lists."""
+        if not pairs:
+            return [], []
+        sort_key = key_fn if key_fn else lambda x: x[0].numel()
+        pairs.sort(key=sort_key, reverse=True)
+        params, names = list(zip(*pairs))
+        return list(params), list(names)
+
+    @torch.no_grad()
+    def get_momentum_or_grad(self, p, momentum, nesterov):
         """Retrieve effective gradient for a parameter.
 
         Assumes momentum buffer has already been updated in pre-pass.
@@ -282,7 +375,7 @@ class DistributedMuon(Optimizer):
 
         if not self.is_light and use_momentum:
             state = self.state.get(p, None)
-            if state is None or "momentum_buffer" not in state:
+            if state is None or state.get("momentum_buffer") is None:
                 raise ValueError(
                     "Momentum buffer missing; ensure pre-pass ran before "
                     "calling get_momentum_or_grad."
@@ -290,20 +383,20 @@ class DistributedMuon(Optimizer):
             buf = state["momentum_buffer"]
             g = buf if not nesterov else g.add(buf, alpha=momentum)
 
-        if gather_to_local and isinstance(g, DTensor):
-            from torch.distributed.tensor.placement_types import Replicate
-
-            g = g.redistribute(placements=[Replicate()] * g.device_mesh.ndim).to_local()
-
         return g
 
     @torch.no_grad()
-    def prepare_gradients_and_momentum(self):
+    def prepare_gradients_and_momentum(self, skip_param_types=None):
         """Fused pre-pass: update momentum buffers for all params with grads.
 
         buf <- m * buf + (1 - m) * g
         Uses foreach kernels per (device, dtype, momentum).
+        When skip_param_types is provided, params of those types are skipped
+        (their momentum update happens later in step_experts/step_fsdp).
         """
+        if skip_param_types is None:
+            skip_param_types = set()
+
         buckets = defaultdict(lambda: {"bufs": [], "grads": [], "m": 0.0})
 
         for group in self.param_groups:
@@ -317,8 +410,12 @@ class DistributedMuon(Optimizer):
                 if g is None or not p.requires_grad:
                     continue
 
+                ptype = self._get_param_type(p)
+                if skip_param_types and ptype in skip_param_types:
+                    continue
+
                 state = self.state.setdefault(p, {})
-                if "momentum_buffer" not in state:
+                if "momentum_buffer" not in state or state["momentum_buffer"] is None:
                     state["momentum_buffer"] = torch.zeros_like(g)
                 buf = state["momentum_buffer"]
 
@@ -342,10 +439,12 @@ class DistributedMuon(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        # Refresh schedulables each step
         self._refresh_groups_info()
 
-        self.prepare_gradients_and_momentum()
+        skip_param_types = None
+        if self._swap_enabled and self._swap_container is not None:
+            skip_param_types = {ParamType.Expert, ParamType.FSDP}
+        self.prepare_gradients_and_momentum(skip_param_types=skip_param_types)
 
         self.step_experts(self.expert_params, self.expert_param_names)
         self.step_ddp(self.ddp_params, self.ddp_param_names)
@@ -353,7 +452,7 @@ class DistributedMuon(Optimizer):
 
         return loss
 
-    def step_ddp(self, ddp_params, ddp_param_names, skip_update=False):
+    def step_ddp(self, ddp_params, ddp_param_names):
         if len(ddp_params) == 0:
             return
 
@@ -368,45 +467,73 @@ class DistributedMuon(Optimizer):
 
         local_updates = self._precompute_ddp_local_updates(ddp_params, ctx)
 
-        global_updates = [None] * len(ddp_params)
+        swap_merge_buckets = getattr(self, "_swap_merge_buckets", 1)
+        num_merge_groups = math.ceil(total_buckets / swap_merge_buckets)
 
-        for bucket_idx in range(total_buckets):
-            start_idx = bucket_idx * bucket_size
-            end_idx = min(start_idx + bucket_size, len(ddp_params))
-
-            if skip_update:
-                continue
-
-            bucket = BucketSpec(
-                start_idx=start_idx,
-                end_idx=end_idx,
-                local_updates=local_updates,
-                global_updates=global_updates,
+        for merge_idx in range(num_merge_groups):
+            merge_start_bucket = merge_idx * swap_merge_buckets
+            merge_end_bucket = min(
+                merge_start_bucket + swap_merge_buckets, total_buckets
             )
-            gathered = self._ddp_allgather_bucket(ddp_params, bucket, ctx)
+            merge_start_idx = merge_start_bucket * bucket_size
+            merge_end_idx = min(merge_end_bucket * bucket_size, len(ddp_params))
+            merge_params = ddp_params[merge_start_idx:merge_end_idx]
+            merge_updates: list[Any] = [None] * len(merge_params)
 
-            for i in range(end_idx - start_idx):
-                global_updates[  # pyrefly: ignore[unsupported-operation]
-                    start_idx + i
-                ] = gathered[i]
+            for bucket_idx in range(merge_start_bucket, merge_end_bucket):
+                start_idx = bucket_idx * bucket_size
+                end_idx = min(start_idx + bucket_size, len(ddp_params))
 
-        if not skip_update:
+                gathered = self._ddp_allgather_bucket(
+                    ddp_params,
+                    start_idx,
+                    end_idx,
+                    local_updates,
+                    ctx,
+                )
+                for i in range(end_idx - start_idx):
+                    merge_updates[start_idx - merge_start_idx + i] = gathered[i]
+                del gathered
+
             self.update_bucket_params(
-                ddp_params, global_updates, 0, len(ddp_params), tp_group=ctx.tp_group
+                merge_params,
+                merge_updates,
+                tp_group=ctx.tp_group,
             )
+            del merge_updates
 
-    def step_experts(self, expert_params, expert_param_names, skip_update=False):
+    def step_experts(self, expert_params, expert_param_names):
         if len(expert_params) == 0:
             return
 
         transpose = self.experts_need_transpose
-        for _, p in enumerate(expert_params):
+        use_swap = self._swap_enabled and self._swap_container is not None
+
+        swap_to_device_stream: Any = None
+        swap_to_host_stream: Any = None
+        swap_state: Any = None
+
+        if use_swap:
+            swap_to_device_stream = self._swap_to_device_stream
+            swap_to_host_stream = self._swap_to_host_stream
+
+        for p in expert_params:
             lr, nesterov, momentum, wd, param_kwargs = self.groups_info[
                 self.parameters_to_groups[id(p)]
             ]
+
+            if use_swap:
+                swap_state = self._swap_h2d_single(
+                    p, swap_to_device_stream, swap_to_host_stream
+                )
+                self._update_momentum_single(p, momentum)
+
             g = self.get_momentum_or_grad(p, momentum, nesterov)
             if g is None:
+                if use_swap:
+                    self._swap_d2h_single(swap_state, swap_to_host_stream)
                 continue
+
             u = self.lmo(
                 g,
                 **param_kwargs,
@@ -415,10 +542,17 @@ class DistributedMuon(Optimizer):
                 hybrid_ns=self.hybrid_ns,
             )
 
-            if not skip_update:
-                self.update_bucket_params([p], [u], 0, 1)
+            self.update_bucket_params([p], [u])
 
-    def step_fsdp(self, fsdp_params, fsdp_param_names, skip_update=False):
+            if use_swap:
+                self._swap_d2h_single(swap_state, swap_to_host_stream)
+
+        if use_swap:
+            self._device_module.current_stream().wait_stream(
+                swap_to_host_stream
+            )  # pyrefly: ignore[missing-attribute,unbound-name]
+
+    def step_fsdp(self, fsdp_params, fsdp_param_names):
         if not fsdp_params:
             return
 
@@ -426,46 +560,36 @@ class DistributedMuon(Optimizer):
         if ctx is None:
             return
 
-        global_updates = [None] * len(fsdp_params)
-
         total_buckets = math.ceil(len(fsdp_params) / ctx.world_size)
+        use_swap = self._swap_enabled and self._swap_container is not None
 
-        for bucket_idx in range(total_buckets):
-            start_idx = bucket_idx * ctx.world_size
-            end_idx = min(start_idx + ctx.world_size, len(fsdp_params))
+        swap_merge_buckets = getattr(self, "_swap_merge_buckets", 1)
+        num_merge_groups = math.ceil(total_buckets / swap_merge_buckets)
 
-            u, recv_shapes, send_shapes = self._fsdp_alltoall_and_lmo(
+        swap_ctx = SwapMergeContext(
+            merge_buckets=swap_merge_buckets,
+            use_swap=use_swap,
+            to_device_stream=self._swap_to_device_stream if use_swap else None,
+            to_host_stream=self._swap_to_host_stream if use_swap else None,
+        )
+
+        for merge_idx in range(num_merge_groups):
+            self._process_fsdp_merge_group(
+                merge_idx,
                 fsdp_params,
-                start_idx,
-                end_idx,
                 ctx,
+                swap_ctx,
+                total_buckets,
             )
 
-            if not skip_update:
-                bucket = BucketSpec(
-                    start_idx=start_idx,
-                    end_idx=end_idx,
-                    global_updates=global_updates,
-                    recv_shapes=recv_shapes,
-                    send_shapes=send_shapes,
-                )
-                self._fsdp_scatter_updates(u, bucket, ctx)
+        if use_swap:
+            self._device_module.current_stream().wait_stream(
+                swap_ctx.to_host_stream
+            )  # pyrefly: ignore[missing-attribute,unbound-name]
 
-        if not skip_update:
-            self.update_bucket_params(
-                fsdp_params,
-                global_updates,
-                0,
-                len(fsdp_params),
-                tp_group=ctx.tp_group,
-            )
-
-    def update_bucket_params(self, params, updates, start_idx, end_idx, tp_group=None):
+    def update_bucket_params(self, params, updates, tp_group=None):
         """Apply parameter updates with weight decay and optional TP slicing."""
-        slice_params = params[start_idx:end_idx]
-        slice_updates = updates[: (end_idx - start_idx)]
-
-        prepared = self._prepare_updates(slice_params, slice_updates, tp_group)
+        prepared = self._prepare_updates(params, updates, tp_group)
 
         buckets = defaultdict(
             lambda: {
@@ -506,6 +630,171 @@ class DistributedMuon(Optimizer):
             if wd != 0.0:
                 torch._foreach_mul_(data["locals"], 1.0 - wd * lr)
             torch._foreach_add_(data["locals"], data["updates"], alpha=-lr)
+
+    @torch.no_grad()
+    def _slice_update_for_tp(self, p, u, tp_group):
+        if not isinstance(p, DTensor):
+            return u
+        p_local = p.to_local()
+        placements = p.placements
+        tp_mesh_dim = tp_axis(placements, tp_enabled=(u.shape == p.shape))
+        if tp_mesh_dim is None:
+            return u
+        shard_dim = placements[tp_mesh_dim].dim  # pyrefly: ignore[missing-attribute]
+        if u.shape == p_local.shape:
+            return u
+        chunk_size = p_local.shape[shard_dim]
+        start = tp_group.rank() * chunk_size
+        slicer = [slice(None)] * u.dim()
+        slicer[shard_dim] = slice(start, start + chunk_size)
+        return u[tuple(slicer)]
+
+    @torch.no_grad()
+    def _update_momentum_single(self, p, momentum):
+        m = float(momentum)
+        if not (0.0 < m < 1.0):
+            return
+        g = getattr(p, "grad", None)
+        if g is None or not p.requires_grad:
+            return
+        state = self.state.get(p, {})
+        buf = state.get("momentum_buffer", None)
+        if buf is None:
+            raise RuntimeError(
+                f"momentum_buffer is None for param {p.shape} after swap_to_device. "
+                f"Check swap state initialization."
+            )
+        buf_local = buf.to_local() if isinstance(buf, DTensor) else buf
+        g_local = g.to_local() if isinstance(g, DTensor) else g
+        buf_local.lerp_(g_local, 1.0 - m)
+
+    def _get_param_type(self, p):
+        ptype = self._param_type_map.get(id(p), None)
+        if ptype is not None:
+            return ptype
+        pid = id(p)
+        if pid in self._expert_param_ids:
+            ptype = ParamType.Expert
+        elif pid in self._fsdp_param_ids:
+            ptype = ParamType.FSDP
+        elif pid in self._ddp_param_ids:
+            ptype = ParamType.DDP
+        else:
+            ptype = ParamType.DDP
+        self._param_type_map[pid] = ptype
+        return ptype
+
+    def _swap_h2d_single(self, param, swap_to_device_stream, swap_to_host_stream):
+        dev = self._device_module  # pyrefly: ignore[missing-attribute]
+        swap_state = self._swap_container.get_swap_state(
+            id(param)
+        )  # pyrefly: ignore[missing-attribute]
+        with dev.stream(swap_to_device_stream):  # pyrefly: ignore[missing-attribute]
+            swap_to_device_stream.wait_stream(swap_to_host_stream)
+            swap_state.swap_to_device(stream=swap_to_device_stream)
+        swap_state.wait_swap()
+        return swap_state
+
+    def _swap_d2h_single(self, swap_state, swap_to_host_stream):
+        dev = self._device_module  # pyrefly: ignore[missing-attribute]
+        compute_done = (
+            dev.current_stream().record_event()
+        )  # pyrefly: ignore[missing-attribute]
+        with dev.stream(swap_to_host_stream):  # pyrefly: ignore[missing-attribute]
+            swap_to_host_stream.wait_event(compute_done)
+            swap_state.swap_to_host(stream=swap_to_host_stream)
+
+    def _swap_h2d_merge_group(self, params, swap_to_device_stream, swap_to_host_stream):
+        dev = self._device_module  # pyrefly: ignore[missing-attribute]
+        with dev.stream(swap_to_device_stream):  # pyrefly: ignore[missing-attribute]
+            swap_to_device_stream.wait_stream(swap_to_host_stream)
+            for p in params:
+                swap_state = self._swap_container.get_swap_state(
+                    id(p)
+                )  # pyrefly: ignore[missing-attribute]
+                swap_state.swap_to_device(stream=swap_to_device_stream)
+        h2d_done_event = swap_to_device_stream.record_event()
+        dev.current_stream().wait_event(
+            h2d_done_event
+        )  # pyrefly: ignore[missing-attribute]
+        for p in params:
+            swap_state = self._swap_container.get_swap_state(
+                id(p)
+            )  # pyrefly: ignore[missing-attribute]
+            swap_state.wait_swap()
+
+    def _swap_momentum_update(self, params):
+        for p in params:
+            momentum = self.groups_info[self.parameters_to_groups[id(p)]][2]
+            self._update_momentum_single(p, momentum)
+
+    def _swap_d2h_merge_group(self, params, swap_to_host_stream):
+        dev = self._device_module  # pyrefly: ignore[missing-attribute]
+        compute_done = (
+            dev.current_stream().record_event()
+        )  # pyrefly: ignore[missing-attribute]
+        with dev.stream(swap_to_host_stream):  # pyrefly: ignore[missing-attribute]
+            swap_to_host_stream.wait_event(compute_done)
+            for p in params:
+                swap_state = self._swap_container.get_swap_state(
+                    id(p)
+                )  # pyrefly: ignore[missing-attribute]
+                swap_state.swap_to_host(stream=swap_to_host_stream)
+
+    def _process_fsdp_merge_group(
+        self,
+        merge_idx,
+        fsdp_params,
+        ctx,
+        swap_ctx: SwapMergeContext,
+        total_buckets,
+    ):
+        merge_start_bucket = merge_idx * swap_ctx.merge_buckets
+        merge_end_bucket = min(
+            merge_start_bucket + swap_ctx.merge_buckets, total_buckets
+        )
+        merge_start_idx = merge_start_bucket * ctx.world_size
+        merge_end_idx = min(merge_end_bucket * ctx.world_size, len(fsdp_params))
+        merge_params = fsdp_params[merge_start_idx:merge_end_idx]
+        merge_updates: list[Any] = [None] * len(merge_params)
+
+        if swap_ctx.use_swap:
+            self._swap_h2d_merge_group(
+                merge_params, swap_ctx.to_device_stream, swap_ctx.to_host_stream
+            )
+
+        for bucket_idx in range(merge_start_bucket, merge_end_bucket):
+            start_idx = bucket_idx * ctx.world_size
+            end_idx = min(start_idx + ctx.world_size, len(fsdp_params))
+
+            if swap_ctx.use_swap:
+                self._swap_momentum_update(fsdp_params[start_idx:end_idx])
+
+            u, recv_shapes, send_shapes = self._fsdp_alltoall_and_lmo(
+                fsdp_params,
+                start_idx,
+                end_idx,
+                ctx,
+            )
+            recv_list_updates = self._fsdp_scatter_updates(
+                u,
+                recv_shapes,
+                send_shapes,
+                ctx,
+            )
+            for i in range(end_idx - start_idx):
+                merge_updates[start_idx - merge_start_idx + i] = recv_list_updates[i]
+            del recv_list_updates
+
+        self.update_bucket_params(
+            merge_params,
+            merge_updates,
+            tp_group=ctx.tp_group,
+        )
+        del merge_updates
+
+        if swap_ctx.use_swap:
+            self._swap_d2h_merge_group(merge_params, swap_ctx.to_host_stream)
 
     def _build_defaults(self, **kwargs):
         return dict(
@@ -640,6 +929,10 @@ class DistributedMuon(Optimizer):
 
         self._finalize_ddp_param_lists()
 
+        self._expert_param_ids = {id(p) for p in self.expert_params}
+        self._fsdp_param_ids = {id(p) for p in self.fsdp_params}
+        self._ddp_param_ids = {id(p) for p in self.ddp_params}
+
     def _collect_bucket_grads(
         self,
         fsdp_params,
@@ -685,43 +978,42 @@ class DistributedMuon(Optimizer):
 
         return grads_send_list, send_shapes, target_shape, param_kwargs_me
 
-    def _ddp_allgather_bucket(self, ddp_params, bucket: BucketSpec, ctx: CommContext):
-        if bucket.local_updates is None:
-            raise ValueError("bucket.local_updates must not be None")
-        if bucket.global_updates is None:
-            raise ValueError("bucket.global_updates must not be None")
-        my_idx = bucket.start_idx + ctx.rank
-        if my_idx < bucket.end_idx:
-            send_u = bucket.local_updates.get(my_idx)
+    def _ddp_allgather_bucket(
+        self, ddp_params, start_idx, end_idx, local_updates, ctx: CommContext
+    ):
+        my_idx = start_idx + ctx.rank
+        if my_idx < end_idx:
+            send_u = local_updates.get(my_idx)
             if send_u is None:
                 ref = ddp_params[my_idx]
                 send_u = torch.zeros(ref.shape, dtype=ctx.cast_dtype, device=ctx.device)
         else:
-            ref = ddp_params[bucket.end_idx - 1]
+            ref = ddp_params[end_idx - 1]
             send_u = torch.zeros(ref.shape, dtype=ctx.cast_dtype, device=ctx.device)
 
         if ctx.dp_group is not None and ctx.world_size > 1:
-            gathered = []
-            pad_buffer = None
-            for i in range(ctx.world_size):  # pyrefly: ignore[bad-assignment]
-                param_idx = bucket.start_idx + i
+            gathered: list[Any] = []
+            pad_buffer: Any = None
+            for i in range(ctx.world_size):
+                param_idx = start_idx + i
                 if param_idx < len(ddp_params):
                     ref = ddp_params[param_idx]
-                    if bucket.global_updates[param_idx] is None:
-                        bucket.global_updates[  # pyrefly: ignore[bad-assignment]
-                            param_idx
-                        ] = torch.empty(
-                            ref.shape, dtype=ctx.cast_dtype, device=ctx.device
+                    gathered.append(
+                        torch.empty(
+                            ref.shape,
+                            dtype=ctx.cast_dtype,
+                            device=ctx.device,
                         )
-                    recv = bucket.global_updates[param_idx]
+                    )
                 else:
-                    ref = ddp_params[bucket.end_idx - 1]
+                    ref = ddp_params[end_idx - 1]
                     if pad_buffer is None or pad_buffer.shape != ref.shape:
                         pad_buffer = torch.empty(
-                            ref.shape, dtype=ctx.cast_dtype, device=ctx.device
+                            ref.shape,
+                            dtype=ctx.cast_dtype,
+                            device=ctx.device,
                         )
-                    recv = pad_buffer
-                gathered.append(recv)
+                    gathered.append(pad_buffer)
             dist.all_gather(gathered, send_u, group=ctx.dp_group)
             return gathered
 
@@ -803,24 +1095,15 @@ class DistributedMuon(Optimizer):
 
         return u, recv_shapes, send_shapes
 
-    def _fsdp_scatter_updates(self, u, bucket: BucketSpec, ctx: CommContext):
-        if bucket.recv_shapes is None:
-            raise ValueError("bucket.recv_shapes must not be None")
-        if bucket.send_shapes is None:
-            raise ValueError("bucket.send_shapes must not be None")
-        if bucket.global_updates is None:
-            raise ValueError("bucket.global_updates must not be None")
-        split_rows = [s[0] for s in bucket.recv_shapes]
+    def _fsdp_scatter_updates(self, u, recv_shapes, send_shapes, ctx: CommContext):
+        split_rows = [s[0] for s in recv_shapes]
         updates_send_list = list(torch.split(u, split_rows, dim=0))
         recv_list_updates = [
-            torch.empty(s, dtype=ctx.cast_dtype, device=ctx.device)
-            for s in bucket.send_shapes
+            torch.empty(s, dtype=ctx.cast_dtype, device=ctx.device) for s in send_shapes
         ]
 
         dist.all_to_all(recv_list_updates, updates_send_list, group=ctx.fsdp_group)
-
-        for i in range(bucket.end_idx - bucket.start_idx):
-            bucket.global_updates[bucket.start_idx + i] = recv_list_updates[i]
+        return recv_list_updates
 
     def _gather_grad_local(self, g, tp_group, tp_world_size):
         if not isinstance(g, DTensor):
@@ -843,15 +1126,6 @@ class DistributedMuon(Optimizer):
         self.expert_enabled = parallel_dims.ep_enabled
         self.dp_replicate_enabled = parallel_dims.dp_replicate_enabled
         self.tp_enabled = parallel_dims.tp_enabled
-
-        if self.dp_replicate_enabled or self.fsdp_enabled:
-            loss_mesh = parallel_dims.get_optional_mesh("loss")
-            if loss_mesh is not None:
-                self.is_dp_rank_0 = dist.get_rank(loss_mesh.get_group()) == 0
-            else:
-                self.is_dp_rank_0 = dist.get_rank() == 0
-        else:
-            self.is_dp_rank_0 = dist.get_rank() == 0
 
     def _log_init_info(self, info: InitInfo):
         logger.info(
@@ -926,24 +1200,6 @@ class DistributedMuon(Optimizer):
             for param in group["params"]:
                 self.parameters_to_groups[id(param)] = group_idx
 
-    @torch.no_grad()
-    def _slice_update_for_tp(self, p, u, tp_group):
-        if not isinstance(p, DTensor):
-            return u
-        p_local = p.to_local()
-        placements = p.placements
-        tp_mesh_dim = tp_axis(placements, tp_enabled=(u.shape == p.shape))
-        if tp_mesh_dim is None:
-            return u
-        shard_dim = placements[tp_mesh_dim].dim  # pyrefly: ignore[missing-attribute]
-        if u.shape == p_local.shape:
-            return u
-        chunk_size = p_local.shape[shard_dim]
-        start = tp_group.rank() * chunk_size
-        slicer = [slice(None)] * u.dim()
-        slicer[shard_dim] = slice(start, start + chunk_size)
-        return u[tuple(slicer)]
-
     def _validate_and_set_expert_layout(self, experts_weights_layout):
         if experts_weights_layout not in [
             "G-D_in-D_out",
@@ -953,94 +1209,6 @@ class DistributedMuon(Optimizer):
                 f"Unknown experts weights layout: {experts_weights_layout}"
             )
         self.experts_need_transpose = experts_weights_layout == "G-D_in-D_out"
-
-    @staticmethod
-    @torch.no_grad()
-    def lmo(
-        g,
-        eps,
-        backend_steps,
-        transpose_experts=False,
-        adjust_lr_fn="original",
-        hybrid_ns=False,
-    ):
-        """LMO: Low-orthogonal Matrix Operation (zeropower + normalise).
-
-        Supports: 2D (linear), 3D (MoE expert).
-        """
-        g = g.to_local() if isinstance(g, DTensor) else g
-
-        def _orth_and_norm(x):
-            x = zeropower_via_newtonschulz5(
-                x, steps=backend_steps, eps=eps, hybrid_ns=hybrid_ns
-            )
-            x = DistributedMuon.normalise_grad(x, eps=eps, adjust_lr_fn=adjust_lr_fn)
-            return x
-
-        if g.ndim == 2:
-            return _orth_and_norm(g)
-        elif g.ndim == 3:
-            if g.shape[0] > 0:
-                g = g.transpose(1, 2) if transpose_experts else g
-                g = _orth_and_norm(g)
-                g = g.transpose(1, 2) if transpose_experts else g
-            return g
-        else:
-            raise ValueError(f"lmo expects 2D or 3D grad, got shape: {g.shape}")
-
-    @staticmethod
-    @torch.no_grad()
-    def normalise_grad(g, eps, adjust_lr_fn="original"):
-        """Normalise gradient tensor with spectral norm factor."""
-        a, b = g.size(-2), g.size(-1)
-        if adjust_lr_fn is None or adjust_lr_fn == "original":
-            g = g * math.sqrt(max(1, a / b))
-        elif adjust_lr_fn == "match_rms_adamw":
-            g = g * 0.18 * math.sqrt(max(a, b))  # deepseekV4 use 0.18
-        return g
-
-    @staticmethod
-    def _resolve_named_params(param_names, param_groups):
-        """Build (name, param) pairs from param_names and param_groups."""
-        all_params = []
-        for group in param_groups:
-            all_params.extend(group["params"])
-
-        if len(param_names) == len(all_params):
-            return list(zip(param_names, all_params))
-
-        named_params = []
-        for group in param_groups:
-            group_pnames = group.get("param_names", None)
-            if group_pnames is not None:
-                named_params.extend(zip(group_pnames, group["params"]))
-            else:
-                for p in group["params"]:
-                    named_params.append((f"param_{id(p)}", p))
-        return named_params
-
-    @staticmethod
-    def _snake_interleave(pairs, w):
-        """Snake-interleave pairs across w DP replicas."""
-        if w <= 1:
-            return pairs
-        # fmt: off
-        blocks = [pairs[i:i + w] for i in range(0, len(pairs), w)]
-        # fmt: on
-        for b, blk in enumerate(blocks):
-            if b % 2 == 1:
-                blk.reverse()
-        return [p for blk in blocks for p in blk]
-
-    @staticmethod
-    def _sort_pairs_by_numel(pairs, key_fn=None):
-        """Sort (param, name) pairs and unzip back into two lists."""
-        if not pairs:
-            return [], []
-        sort_key = key_fn if key_fn else lambda x: x[0].numel()
-        pairs.sort(key=sort_key, reverse=True)
-        params, names = list(zip(*pairs))
-        return list(params), list(names)
 
 
 _MUON_EXCLUDED_KEYWORDS = ("embed", "lm_head", "output")
@@ -1060,7 +1228,6 @@ def _classify_param(name, p):
 
 def _split_parameters_for_muon(
     model_parts: list[nn.Module],
-    parallel_dims: ParallelDims | None = None,
 ) -> tuple[list[nn.Parameter], list[str], list[nn.Parameter], list[str]]:
     """Split parameters into Muon (2D/3D) and AdamW (others) groups.
 
@@ -1172,7 +1339,7 @@ def build_muon_hybrid_optimizers(
         muon_param_names,
         adamw_params,
         adamw_param_names,
-    ) = _split_parameters_for_muon(model_parts, parallel_dims)
+    ) = _split_parameters_for_muon(model_parts)
 
     logger.info(
         f"[MuonAdamW] Muon optimizer parameters ({len(muon_param_names)}): {muon_param_names}"
@@ -1465,7 +1632,7 @@ class VirtualMuonHybridOptimizersContainer(MuonHybridOptimizersContainer):
         self._for_each_optim_state(self._swap_optim_states_to_host)
 
 
-class MuonLRSchedulersContainer:
+class MuonLRSchedulersContainer(Stateful):
     """LR Scheduler container for Muon hybrid optimizers.
 
     Creates independent LambdaLR schedulers for Muon and AdamW,
@@ -1474,6 +1641,10 @@ class MuonLRSchedulersContainer:
     Key difference from upstream LRSchedulersContainer:
     - Upstream: assumes all optimizers use the same base_lr
     - This class: allows Muon and AdamW to have different base_lr
+
+    Inherits from Stateful so DCP correctly saves/loads lr_scheduler state.
+    Without this, checkpoint resume would not restore last_epoch, causing
+    wrong LR values after step 6+.
 
     Note: state_dict only saves the first scheduler's state (last_epoch),
     consistent with upstream behavior since Muon and AdamW share the same

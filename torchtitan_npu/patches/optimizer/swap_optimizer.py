@@ -22,7 +22,6 @@ from typing import Any, TypeVar
 import torch
 import torch.nn as nn
 import torchtitan
-import torchtitan.components.optimizer
 from torch.distributed.checkpoint.state_dict import _get_fqns
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
@@ -38,7 +37,9 @@ logger = logging.getLogger(__name__)
 
 
 T = TypeVar("T", bound=Optimizer)
-_original_build_optimizers = torchtitan.components.optimizer.build_optimizers
+_original_build_optimizers = (
+    torchtitan.components.optimizer.build_optimizers  # pyrefly: ignore[implicit-import]
+)
 
 
 def get_torch_device():
@@ -106,6 +107,7 @@ class SwapOptimizersContainer(OptimizersContainer):
 
     state_keys = ["exp_avg", "exp_avg_sq", "max_exp_avg_sq"]
     _MISSING = object()
+    MISSING = _MISSING
 
     def __init__(
         self,
@@ -521,6 +523,21 @@ class SwapOptimizersContainer(OptimizersContainer):
             raise
         self._empty_device_cache()
 
+    # Public aliases for classmethods used by subclasses
+    fqns_by_param = _fqns_by_param
+    clone_to_cpu_cache = _clone_to_cpu_cache
+    state_step_for_state_dict = _state_step_for_state_dict
+    add_param_state_to_state_dict = _add_param_state_to_state_dict
+    add_param_group_to_state_dict = _add_param_group_to_state_dict
+    optimizer_state_dict = _optimizer_state_dict
+    wait_pending_swap_to_host = _wait_pending_swap_to_host
+    load_param_group = _load_param_group
+    load_param_state = _load_param_state
+    state_dict_value_for_fqns = _state_dict_value_for_fqns
+    clone_loaded_value = _clone_loaded_value
+    load_optimizer_state_dict = _load_optimizer_state_dict
+    empty_device_cache = _empty_device_cache
+
 
 def param_update(param, state, param_group):
     beta1, beta2 = param_group["betas"]
@@ -654,12 +671,27 @@ def _build_optimizers_wrapper(
     model_parts, optimizer_config, parallel_dims, ft_manager=None
 ):
     if getattr(optimizer_config, "name", None) == "Muon":
-        if getattr(optimizer_config, "swap_optimizer", False):
-            raise ValueError(
-                "Muon optimizer does not support swap_optimizer. "
-                "Please set swap_optimizer=false in your config."
-            )
+        swap_optimizer = getattr(optimizer_config, "swap_optimizer", False)
         virtual_allocator = getattr(optimizer_config, "virtual_allocator", False)
+
+        if swap_optimizer and virtual_allocator:
+            raise ValueError(
+                "Cannot use both swap_optimizer and virtual_allocator for Muon. "
+                "Please set one of them to false."
+            )
+
+        if swap_optimizer:
+            from torchtitan_npu.patches.optimizer.swap_muon_optimizer import (
+                build_swap_muon_hybrid_optimizers,
+            )
+
+            return build_swap_muon_hybrid_optimizers(
+                model_parts,
+                optimizer_config,
+                parallel_dims,
+                ft_manager,
+            )
+
         return build_muon_hybrid_optimizers(
             model_parts,
             optimizer_config,
@@ -707,4 +739,6 @@ def _build_optimizers_wrapper(
 
 
 # patch build_optimizers function
-torchtitan.components.optimizer.build_optimizers = _build_optimizers_wrapper
+torchtitan.components.optimizer.build_optimizers = (  # pyrefly: ignore[implicit-import]
+    _build_optimizers_wrapper
+)
