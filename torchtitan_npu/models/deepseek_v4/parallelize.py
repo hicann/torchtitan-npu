@@ -18,10 +18,16 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointWrapper,
 )
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import distribute_tensor, Replicate, Shard
+from torch.distributed.tensor import (
+    distribute_module,
+    distribute_tensor,
+    Replicate,
+    Shard,
+)
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     parallelize_module,
+    ParallelStyle,
     PrepareModuleInput,
     PrepareModuleInputOutput,
     RowwiseParallel,
@@ -157,6 +163,44 @@ def _register_distributed_parameter(
         )
     )
     module.register_parameter(name, dt)
+
+
+class HcHeadParallelStyle(ParallelStyle):
+    _param_names = ("hc_head_fn", "hc_head_base", "hc_head_scale")
+
+    def __init__(self) -> None:
+        self.io_plan = PrepareModuleInputOutput(
+            input_layouts=(Shard(1),),
+            desired_input_layouts=(Replicate(),),
+            use_local_input=False,
+            output_layouts=(Replicate()),
+            desired_output_layouts=(Shard(1)),
+            use_local_output=False,
+        )
+
+    def partition_fn(
+        self, name: str, module: nn.Module, device_mesh: DeviceMesh
+    ) -> None:
+        del name
+        for param_name in self._param_names:
+            param = getattr(module, param_name, None)
+            if param is None:
+                continue
+            module.register_parameter(
+                param_name,
+                nn.Parameter(
+                    distribute_tensor(
+                        param,
+                        device_mesh=device_mesh,
+                        placements=[Replicate()],
+                        src_data_rank=0,
+                    )
+                ),
+            )
+
+    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        module = distribute_module(module, device_mesh, self.partition_fn)
+        return parallelize_module(module, device_mesh, self.io_plan)
 
 
 def parallelize_deepseek_v4(
@@ -362,18 +406,10 @@ def apply_non_moe_tp(
         PrepareModuleInput,
         PrepareModuleInputOutput,
     )
-    hc_head_plan = prepare_module_input_output(
-        input_layouts=(Shard(1),),
-        desired_input_layouts=(Replicate(),),
-        use_local_input=False,
-        output_layouts=(Replicate()),
-        desired_output_layouts=(Shard(1)),
-        use_local_output=False,
-    )
+    hc_head_plan = HcHeadParallelStyle()
     tok_embeddings = getattr(model, "tok_embeddings", None)
     norm = getattr(model, "norm", None)
     output = getattr(model, "output", None)
-    hc_head = getattr(model, "hc_head", None)
 
     root_parallelize_plan: dict[str, Any] = {}
     if tok_embeddings is not None:
@@ -389,27 +425,13 @@ def apply_non_moe_tp(
             output_layouts=Shard(-1) if loss_parallel else Replicate(),
             use_local_output=not loss_parallel,
         )
-    if hc_head is not None:
-        root_parallelize_plan["hc_head"] = hc_head_plan
 
     if root_parallelize_plan:
         parallelize_module(model, tp_mesh, root_parallelize_plan)
 
-    if hc_head is not None:
-        if not isinstance(hc_head, nn.Module):
-            raise RuntimeError("DeepSeekV4 TP expected hc_head to be an nn.Module.")
-        for param_name in ("hc_head_fn", "hc_head_base", "hc_head_scale"):
-            if getattr(hc_head, param_name, None) is None:
-                raise RuntimeError(
-                    f"DeepSeekV4 TP expected hc_head.{param_name} "
-                    "when hc_head is present."
-                )
-            _register_distributed_parameter(
-                hc_head,
-                param_name,
-                tp_mesh,
-                [Replicate()],
-            )
+    # NOTE: hc_head now lives inside the last main transformer layer
+    # (``transformer_block.hc_head`` when ``is_last_layer``); its TP plan is
+    # applied in the per-layer loop below.
 
     attention_kernel_plan_ratio1 = PrepareModuleInputOutputWithBwdAllReduce(
         bwd_allreduce_inputs=(False, True, False, False, False),
@@ -610,7 +632,6 @@ def apply_non_moe_tp(
             tp_mesh,
             [Replicate()],
         )
-
         # pyrefly: ignore [missing-attribute]
         if transformer_block.attention.compress_ratio == 1:
             attention_kernel_plan = attention_kernel_plan_ratio1
@@ -620,7 +641,7 @@ def apply_non_moe_tp(
         else:
             attention_kernel_plan = attention_kernel_plan_ratio128
 
-        layer_plan = {
+        layer_plan: dict[str, ParallelStyle] = {
             "attention_norm": SequenceParallel(),
             "attention": prepare_module_input(
                 input_layouts=(Shard(1), Replicate(), None, None),
@@ -649,6 +670,11 @@ def apply_non_moe_tp(
             "hc_pre.torch_hc_split_sinkhorn": hc_pre_sinkhon_plan,
             "ffn_norm": SequenceParallel(),
         }
+        if getattr(transformer_block, "is_last_layer", False):
+            # hc_head runs at the end of this block's forward (input is the
+            # post-hc_post Shard(1) activation, same layout it had when hc_head
+            # was at the root), so the same plan applies.
+            layer_plan.update({"hc_head": hc_head_plan})
         # pyrefly: ignore [missing-attribute]
         if transformer_block.attention.compress_ratio > 1:
             # pyrefly: ignore [missing-attribute]
@@ -735,27 +761,6 @@ def apply_non_moe_tp(
                     "mtp_norm": SequenceParallel(),
                     "mtp_hc_head": hc_head_plan,
                 }
-            )
-            _register_distributed_parameter(
-                # pyrefly: ignore [bad-argument-type]
-                transformer_block,
-                "mtp_hc_head_fn",
-                tp_mesh,
-                [Replicate()],
-            )
-            _register_distributed_parameter(
-                # pyrefly: ignore [bad-argument-type]
-                transformer_block,
-                "mtp_hc_head_base",
-                tp_mesh,
-                [Replicate()],
-            )
-            _register_distributed_parameter(
-                # pyrefly: ignore [bad-argument-type]
-                transformer_block,
-                "mtp_hc_head_scale",
-                tp_mesh,
-                [Replicate()],
             )
 
         parallelize_module(

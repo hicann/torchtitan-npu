@@ -66,9 +66,10 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
             "layers.{}.hc_ffn_base": "layers.{}.hc_ffn_base",
             "layers.{}.hc_ffn_fn": "layers.{}.hc_ffn_fn",
             "layers.{}.hc_ffn_scale": "layers.{}.hc_ffn_scale",
-            "hc_head_base": "hc_head.hc_head_base",
-            "hc_head_fn": "hc_head.hc_head_fn",
-            "hc_head_scale": "hc_head.hc_head_scale",
+            # Main hc_head now lives inside the last main transformer layer.
+            "hc_head_base": f"layers.{model_args.n_layers - 1}.hc_head.hc_head_base",
+            "hc_head_fn": f"layers.{model_args.n_layers - 1}.hc_head.hc_head_fn",
+            "hc_head_scale": f"layers.{model_args.n_layers - 1}.hc_head.hc_head_scale",
             "norm.weight": "norm.weight",
             "head.weight": "output.weight",
         }
@@ -146,6 +147,12 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
         self._input_format = "hf"
         self._input_expert_format = "standard"
         self._to_hf_map = {v: k for k, v in self.from_hf_map.items()}
+        # The main hc_head's titan FQN (layers.{last}.hc_head.*) contains a layer
+        # number, so to_hf routes it through _map_layer_key (abstract-key lookup
+        # on "layers.{}..."). Register the abstract inverse explicitly; the HF
+        # side has no layer index (top-level hc_head_*), so .format() is a no-op.
+        for _hc_param in ("hc_head_fn", "hc_head_base", "hc_head_scale"):
+            self._to_hf_map[f"layers.{{}}.hc_head.{_hc_param}"] = _hc_param
         self._to_hf_passthrough = (
             "tid2eid",
             "compressor",

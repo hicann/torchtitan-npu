@@ -6,12 +6,12 @@
 
 from torchtitan.components.loss import build_cross_entropy_loss
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
+from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.protocols.model_spec import ModelSpec
 
 from .model import DeepSeekV4Model
 from .moe import MoEArgs
 from .parallelize import parallelize_deepseek_v4
-from .pipeline_parallel import pipeline_deepseek_v4
 from .state_dict_adapter import DeepSeekV4StateDictAdapter
 
 
@@ -311,7 +311,7 @@ def model_registry(flavor: str) -> ModelSpec:
         model=deepseekv4_configs[flavor](),
         build_loss_fn=build_cross_entropy_loss,
         parallelize_fn=parallelize_deepseek_v4,
-        pipelining_fn=pipeline_deepseek_v4,
+        pipelining_fn=pipeline_llm,
         post_optimizer_build_fn=register_moe_load_balancing_hook,
         state_dict_adapter=DeepSeekV4StateDictAdapter,
     )

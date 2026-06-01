@@ -1074,6 +1074,19 @@ class DeepSeekV4TransformerBlock(Module):
             if layer_id < model_args.n_layers
             else model_args.mtp_layer_compress_ratio
         )
+        # The final MHC aggregation (hc_head) lives inside the *last* main
+        # transformer layer so it runs within this block's forward (and FSDP
+        # unit) -- its params are therefore gathered when used, and the generic
+        # PP splitter keeps it on the last stage with no DeepSeek-specific
+        # splicing. MTP modules carry their own ``mtp_hc_head`` instead.
+        self.is_last_layer = layer_id == model_args.n_layers - 1
+        if self.is_last_layer:
+            self.hc_head = HcHead.Config(
+                norm_eps=self.norm_eps,
+                hc_eps=self.hc_eps,
+                hc_mult=hc_mult,
+                dim=model_args.dim,
+            ).build()
 
     def forward(
         self,
@@ -1112,6 +1125,9 @@ class DeepSeekV4TransformerBlock(Module):
         x = self.ffn_norm(x)
         x = self.moe(x, input_ids)
         x = self.hc_post(x, residual, post, comb)
+        if self.is_last_layer:
+            # Collapse the hc_mult streams: [B, S, hc_mult, D] -> [B, S, D].
+            x = self.hc_head(x)
         return x
 
     def init_weights(self, buffer_device: torch.device):
@@ -1132,6 +1148,10 @@ class DeepSeekV4TransformerBlock(Module):
             nn.init.trunc_normal_(self.hc_attn_base, mean=0.0, std=0.02)
         if self.hc_attn_scale is not None:
             nn.init.trunc_normal_(self.hc_attn_scale, mean=0.0, std=0.02)
+        if self.is_last_layer:
+            nn.init.trunc_normal_(self.hc_head.hc_head_fn, mean=0.0, std=0.02)
+            nn.init.trunc_normal_(self.hc_head.hc_head_base, mean=0.0, std=0.02)
+            nn.init.trunc_normal_(self.hc_head.hc_head_scale, mean=0.0, std=0.02)
 
 
 class HcHead(Module):
@@ -1310,6 +1330,15 @@ class DeepSeekV4Model(BaseModel):
         num_mtp_modules: int = 0
         mtp_layer_compress_ratio: int = 1
 
+        @property
+        def layers(self):
+            # Upstream ``pipeline_llm`` derives the layer count via
+            # ``len(model_config.layers)``. DeepSeek-V4 stores it as the flat int
+            # ``n_layers`` (plus MTP modules) rather than a list of per-layer
+            # configs, so expose a length-compatible view here. MTP + PP is
+            # unsupported, so under PP this is exactly the main layers.
+            return range(self.n_layers + self.num_mtp_modules)
+
         def update_from_config(self, *, trainer_config, **kwargs) -> None:
             seq_len = trainer_config.training.seq_len
             if seq_len > self.max_seq_len:
@@ -1342,6 +1371,14 @@ class DeepSeekV4Model(BaseModel):
                 trainer_config.model_converters.converters, "deepseek_v4_sfa"
             )
             self.num_mtp_modules = trainer_config.training.num_mtp_modules
+            if (
+                trainer_config.parallelism.pipeline_parallel_degree > 1
+                and self.num_mtp_modules > 0
+            ):
+                raise NotImplementedError(
+                    "DeepSeekV4 MTP + PP is not supported yet. "
+                    "Please set training.num_mtp_modules=0 when PP is enabled."
+                )
 
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
@@ -1376,12 +1413,9 @@ class DeepSeekV4Model(BaseModel):
         self.norm = RMSNorm.Config(dim=model_args.dim, eps=self.norm_eps).build()
         self.hc_eps = model_args.hc_eps
         self.hc_mult = model_args.hc_mult
-        self.hc_head = HcHead.Config(
-            norm_eps=self.norm_eps,
-            hc_eps=self.hc_eps,
-            hc_mult=model_args.hc_mult,
-            dim=model_args.dim,
-        ).build()
+        # hc_head now lives inside the last main transformer layer (see
+        # DeepSeekV4TransformerBlock); the main stack's output is already the
+        # aggregated [B, S, D] when it reaches norm/output here.
         self.model_args = model_args
         self.tok_embeddings = Embedding.Config(
             num_embeddings=model_args.vocab_size,
@@ -1454,8 +1488,8 @@ class DeepSeekV4Model(BaseModel):
         if self.output is None:
             return h
 
-        self._validate_last_stage_hc_head()
-        h = self.hc_head(h)
+        # The last main transformer layer already applied hc_head, so ``h`` is
+        # the aggregated [B, S, D] hidden state here.
         prev_embed = h
         h = self.norm(h) if self.norm is not None else h
         output = self.output(h.float()) if self.output is not None else h
@@ -1513,10 +1547,8 @@ class DeepSeekV4Model(BaseModel):
                 layer.init_weights(buffer_device=buffer_device)
         if self.norm is not None:
             nn.init.trunc_normal_(self.norm.weight, mean=1, std=0.02)
-        if self.hc_head is not None:
-            nn.init.trunc_normal_(self.hc_head.hc_head_fn, mean=0.0, std=0.02)
-            nn.init.trunc_normal_(self.hc_head.hc_head_base, mean=0.0, std=0.02)
-            nn.init.trunc_normal_(self.hc_head.hc_head_scale, mean=0.0, std=0.02)
+        # hc_head weights are initialized by the last transformer layer's
+        # init_weights (it owns hc_head now).
         final_out_std = self.model_args.dim**-0.5
         cutoff_factor = 3
         if self.output is not None:
@@ -1534,20 +1566,3 @@ class DeepSeekV4Model(BaseModel):
                 "DeepSeekV4 PP stage requires input_ids kwargs with shape [B, S]."
             )
         return input_ids.detach().long()
-
-    def _validate_last_stage_hc_head(self) -> None:
-        hc_head = self.hc_head
-        if hc_head is None:
-            raise RuntimeError(
-                "DeepSeekV4 PP last stage requires hc_head before norm/output."
-            )
-        missing = [
-            name
-            for name in ("hc_head_fn", "hc_head_base", "hc_head_scale")
-            if getattr(hc_head, name, None) is None
-        ]
-        if missing:
-            raise RuntimeError(
-                "DeepSeekV4 PP last stage requires hc_head.* parameters before "
-                f"norm/output, missing {missing}."
-            )
