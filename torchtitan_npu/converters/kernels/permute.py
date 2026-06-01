@@ -6,6 +6,7 @@
 import logging
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch_npu
 
@@ -23,6 +24,15 @@ from ..registry import register_npu_converter
 from .permutation import NPUMoeTokenUnpermute
 
 logger = logging.getLogger(__name__)
+
+
+def _is_fake_process_group(group) -> bool:
+    if not dist.is_initialized():
+        return False
+    try:
+        return str(dist.get_backend(group)).lower() == "fake"
+    except RuntimeError:
+        return False
 
 
 def _npu_moe_forward_for_dsv32(self, x):
@@ -108,19 +118,29 @@ def _npu_moe_token_dispatch(
     ep_degree = device_mesh.shape[0]
     num_local_experts = num_tokens_per_expert.shape[0] // ep_degree
 
+    ep_group = device_mesh.get_group()
+    fake_pg = _is_fake_process_group(ep_group)
+
     # generate the input splits and output splits for all-to-all
     with torch.no_grad():
-        num_tokens_per_expert_group = all_to_all_single(
-            num_tokens_per_expert,
-            None,
-            None,
-            group=device_mesh.get_group(),
-        )
-        # Need to wait explicitly because it is used by a triton kernel later
-        # which doesn't realize that AsyncCollectiveTensor needs unwrapping
-        num_tokens_per_expert_group = torch.ops._c10d_functional.wait_tensor(
-            num_tokens_per_expert_group
-        )
+        if fake_pg:
+            # FakeProcessGroup's all_to_all returns tensors with valid metadata
+            # but arbitrary values, which would corrupt the split sizes derived
+            # from the exchanged counts. Under fake PG no data actually crosses
+            # ranks, so output == input.
+            num_tokens_per_expert_group = num_tokens_per_expert
+        else:
+            num_tokens_per_expert_group = all_to_all_single(
+                num_tokens_per_expert,
+                None,
+                None,
+                group=ep_group,
+            )
+            # Need to wait explicitly because it is used by a triton kernel later
+            # which doesn't realize that AsyncCollectiveTensor needs unwrapping
+            num_tokens_per_expert_group = torch.ops._c10d_functional.wait_tensor(
+                num_tokens_per_expert_group
+            )
         input_splits = (
             num_tokens_per_expert.view(ep_degree, -1)
             .sum(dim=1)
@@ -135,17 +155,18 @@ def _npu_moe_token_dispatch(
         self.input_splits = input_splits.tolist()
         self.output_splits = output_splits.tolist()
 
-    # perform all-to-all
-    routed_input = all_to_all_single_autograd(
-        routed_input,
-        self.output_splits,
-        self.input_splits,
-        device_mesh.get_group(),
-    )
+    if not fake_pg:
+        # perform all-to-all
+        routed_input = all_to_all_single_autograd(
+            routed_input,
+            self.output_splits,
+            self.input_splits,
+            ep_group,
+        )
 
-    routed_scores = all_to_all_single_autograd(
-        routed_scores, self.output_splits, self.input_splits, device_mesh.get_group()
-    )
+        routed_scores = all_to_all_single_autograd(
+            routed_scores, self.output_splits, self.input_splits, ep_group
+        )
 
     # NOTE: After this all-to-all, the routed input is put on proper EP rank.
     # However, the num_tokens_per_expert_group is not of the final target format
@@ -191,6 +212,8 @@ def _npu_moe_token_combine(
     routed_output = NPUMoeTokenUnpermute.apply(
         routed_output, self.permuted_indices, routed_output.shape
     )
+    if _is_fake_process_group(device_mesh.get_group()):
+        return routed_output
     routed_output = all_to_all_single_autograd(
         routed_output,
         self.input_splits,

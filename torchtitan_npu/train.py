@@ -12,6 +12,7 @@ import importlib
 from functools import wraps
 
 import torch
+import torch.distributed as dist
 import torch_npu
 import torchtitan.train as titan_train
 from torchtitan.config import JobConfig
@@ -203,10 +204,16 @@ def _patch_for_parallel_dims_build_mesh():
         """Patched version which guarantees FSDP and EP uses different PG."""
         world_mesh = _original_build_mesh(self)
 
+        # Both `comm.mode=fake_backend` and `local_tensor` initialize the
+        # default PG via init_process_group("fake", ...). Forcing a real HCCL
+        # PG on the ep dim under either mode would try to rendezvous ep ranks
+        # that don't exist in a single-process dry run.
+        uses_fake_pg = dist.is_initialized() and dist.get_backend().lower() == "fake"
+
         sparse_dims = ("pp", "dp_replicate", "efsdp", "ep", "etp")
         sparse_degrees = tuple(self._meshes[dim].size() for dim in sparse_dims)
         backend_override = {
-            dim: "fake" if dim != "ep"
+            dim: "fake" if dim != "ep" or uses_fake_pg
             # Provide a non-None Option to force Pytorch to create
             # a new ProcessGroup for EP communication.
             else torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
