@@ -14,6 +14,7 @@ from torchtitan.tools.logging import init_logger, logger
 import torchtitan_npu  # noqa: F401
 
 from torchtitan_npu.converters.registry import has_npu_converter
+from torchtitan_npu.distributed.determinism import setup_npu_deterministic_env
 
 _SKIP_FLEX_TO_SDPA_REWRITE_MODELS = {"vlm"}
 _INDUCTOR_NPU_EXT_MODELS = {"deepseek_v3", "deepseek_v4", "deepseek_v32", "vlm"}
@@ -40,6 +41,9 @@ def main() -> None:
 
     config_manager = ConfigManager()
     config = config_manager.parse_args()
+
+    setup_npu_deterministic_env(config.debug)  # pyrefly: ignore [missing-attribute]
+
     trainer = None
 
     model_name = (
