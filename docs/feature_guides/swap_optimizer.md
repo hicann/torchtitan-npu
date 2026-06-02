@@ -6,7 +6,7 @@
 
 ## 实现原理
 
-参考[MindSpeed框架设计的SwapOptimizer特性](https://gitcode.com/Ascend/MindSpeed/blob/master/docs/features/swap-optimizer.md)，我们在 `torchtitan` 框架的优化器构建逻辑中引入了自定义的 `SwapOptimizersContainer`，对原生的 `Adam` 和 `AdamW` 优化器的 `step` 方法进行了无缝拦截与替换，从而使能了优化器状态的动态显存管理。相关代码定义在`torchtitan_npu/patches/optimizer/swap_optimizer.py`。
+参考[MindSpeed框架设计的SwapOptimizer特性](https://gitcode.com/Ascend/MindSpeed/blob/master/docs/zh/features/swap-optimizer.md)，我们在 `torchtitan` 框架的优化器构建逻辑中引入了自定义的 `SwapOptimizersContainer`，对原生的 `Adam` 和 `AdamW` 优化器的 `step` 方法进行了无缝拦截与替换，从而使能了优化器状态的动态显存管理。相关代码定义在`torchtitan_npu/patches/optimizer/swap_optimizer.py`。
 
 本特性主要遵循“按块加载 -> 异步更新 -> 及时卸载”的流水线机制，在确保训练精度的前提下，用多流通算重叠换取巨大的显存空间收益。具体拆解如下：
 

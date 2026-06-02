@@ -12,7 +12,7 @@ torchtitan_npu在`torchtitan_npu/patches/distributed/custom_context_parallel.py`
 ### DSA CP
 定义在`torchtitan_npu/distributed/context_parallel/dsa_cp.py`，为DeepSeek Sparse Attention提供AllGatherKV风格的CP。本项目在遵循torch原生CP设计逻辑的基础上，通过自定义Context Parallel Context，将注意力部分的forward函数进行替换，对KV相关激活做CP域的AllGather，以此确保注意力计算在CP场景下的正确性。
 
-关于DSA CP的更多原理介绍，参考[技术文档](https://gitcode.com/cann/cann-recipes-train/blob/master/docs/llm_pretrain/deepseekv32_pre_train_optimization.md#自定义CP策略)。
+关于DSA CP的更多原理介绍，参考[技术文档](https://gitcode.com/cann/cann-recipes-train/blob/master/docs/llm_pretrain/deepseek-v32_pre_train_optimization.md#自定义CP策略)。
 
 ## 配置选项
 
