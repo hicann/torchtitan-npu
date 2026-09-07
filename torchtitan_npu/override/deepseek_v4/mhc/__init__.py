@@ -5,13 +5,14 @@
 
 """DeepSeek-V4 MHC overrides (registry-facing module).
 
-The CANN fused implementations live in ``ascendc.py`` and the hand-written
-Triton kernels in ``triton.py``; the registrations are defined here so the
-override paths stay ``override.deepseek_v4.mhc.{asc_hc_pre, asc_hc_post,
-triton_hc_pre, triton_hc_post, triton_hc_head}``.  Both entry families
-target the same ``HcPre.Config`` / ``HcPost.Config`` / ``HcHead.Config``
-nodes, so only one of each pair can be enabled at a time
-(``--override.imports`` factory conflict).
+The CANN fused implementations live in ``ascendc.py``, the hand-written
+Triton kernels in ``triton.py``, and the TileLang fused HcHead in
+``tilelang.py``; the registrations are defined here so the override paths stay
+``override.deepseek_v4.mhc.{asc_hc_pre, asc_hc_post, triton_hc_pre,
+triton_hc_post, triton_hc_head, tilelang_hc_head}``.  The HcHead entries
+(``triton_hc_head`` / ``tilelang_hc_head``) target the same ``HcHead.Config``
+node, so only one of them can be enabled at a time; the HcPre/HcPost entries
+target separate nodes and may coexist with a HcHead override.
 """
 
 from torchtitan.config import derive, override
@@ -19,6 +20,7 @@ from torchtitan.config import derive, override
 from torchtitan_npu.models.deepseek_v4.mhc import HcHead, HcPost, HcPre
 
 from .ascendc import AscHcPost, AscHcPre
+from .tilelang import TilelangHcHead
 from .triton import TritonHcHead, TritonHcPost, TritonHcPre
 
 
@@ -65,3 +67,12 @@ def triton_hc_post(cfg: HcPost.Config) -> TritonHcPost.Config:
 )
 def triton_hc_head(cfg: HcHead.Config) -> TritonHcHead.Config:
     return derive(cfg, TritonHcHead.Config)
+
+
+@override(
+    target=HcHead.Config,
+    exact=True,
+    description="TileLang fused DeepSeek-V4 HcHead kernel",
+)
+def tilelang_hc_head(cfg: HcHead.Config) -> TilelangHcHead.Config:
+    return derive(cfg, TilelangHcHead.Config)

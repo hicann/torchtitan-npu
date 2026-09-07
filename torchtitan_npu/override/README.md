@@ -89,6 +89,7 @@ torchtitan_npu/override/
     ├── mhc/
     │   ├── __init__.py
     │   ├── ascendc.py
+    │   ├── tilelang.py
     │   └── triton.py
     └── sparse_attn/
         ├── __init__.py
@@ -128,6 +129,7 @@ torchtitan_npu.override.<scope>.<target>.<variant>
 | `golden` | 模型专属的 eager 数值参考 |
 | `torch` | 完全由标准 PyTorch 算子组成的独立实现 |
 | `triton` | Triton kernel 实现 |
+| `tilelang` | TileLang 融合 kernel 实现 |
 | `workaround` | 保持原计算语义、仅绕过当前后端兼容问题 |
 | 行为名称 | 与计算后端无关的能力，例如 `optimizer.virtual` |
 
@@ -304,10 +306,11 @@ torchtitan_npu.override.deepseek_v3_2.sparse_attn.asc
 | `mhc.triton_hc_pre` | `HcPre.Config` | `TritonHcPre.Config` | 使用 `mhc_pre_sinkhorn_op` + `mhc_pre_bmm_op` |
 | `mhc.triton_hc_post` | `HcPost.Config` | `TritonHcPost.Config` | 使用 `mhc_post_bmm1_op` + `mhc_post_bmm2_op` |
 | `mhc.triton_hc_head` | `HcHead.Config` | `TritonHcHead.Config` | 使用 `mhc_pre_only_sinkhorn_op` + `mhc_pre_bmm_op` |
+| `mhc.tilelang_hc_head` | `HcHead.Config` | `TilelangHcHead.Config` | 使用 `mhc_head_compute_mix_tilelang` (TileLang 融合 kernel) |
 
 `sparse_attn.asc_metadata` 无需参数。`sparse_attn.asc` 还支持可选的 `indexer_loss_coeff`，默认值为 `0.0`。
-MHC 的 `asc_hc_pre` / `asc_hc_post` 与 `triton_hc_pre` / `triton_hc_post` / `triton_hc_head` 是可选入口（`deepseek_v4/__init__.py`
-默认只导入 `sparse_attn`），需要时显式加入 `override.imports`。
+MHC 的 `asc_hc_pre` / `asc_hc_post` 与 `triton_hc_pre` / `triton_hc_post` / `triton_hc_head` / `tilelang_hc_head` 是可选入口（`deepseek_v4/__init__.py`
+默认只导入 `sparse_attn`），需要时显式加入 `override.imports`。`triton_hc_head` 与 `tilelang_hc_head` 声明同一 `HcHead.Config` 节点，两者互斥，只能启用其一；二者均可与 `asc_hc_pre` / `asc_hc_post` 共存。
 推荐直接使用 `examples/deepseek_v4/*.sh` wrapper；单机调试可使用
 [deepseek_v4_mini_1p_cpt_2k_a3.sh](../../examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh)，
 它会组装 `--override.imports` 并调用 `scripts/run_train.sh`：
